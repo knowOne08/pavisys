@@ -9,16 +9,8 @@
 // Test mode - set to true to test serial only, false for full LoRa operation
 #define SERIAL_TEST_MODE false
 
-// LoRa Communication States  
-enum LoRaState {
-  LORA_NORMAL_MODE,     // RX receives telemetry, TX sends
-  LORA_COMMAND_MODE     // RX sends commands, TX listens  
-};
-LoRaState loraState = LORA_NORMAL_MODE;
-unsigned long lastStateChange = 0;
-#define COMMAND_MODE_DURATION 3000  // 3 seconds for command mode
-#define NORMAL_MODE_DURATION 10000  // 10 seconds for normal mode
-String pendingCommand = "";         // Command waiting to be sent
+// Simple command/response system - no state machine needed
+String pendingCommand = "";         // Command to be sent immediately
 
 // === PARACHUTE TEST GROUND STATION ===
 // Ground station operating modes
@@ -61,8 +53,8 @@ void setup() {
   // Add a delay to ensure serial is ready
   delay(2000);
   
-  Serial.println("=== PARACHUTE TEST GROUND STATION ===");
-  Serial.println("Flight Computer Remote Control & Telemetry System");
+  Serial.println("=== RX: GROUND STATION COMMAND SENDER ===");
+  Serial.println("Pure command/response system - no continuous telemetry");
   Serial.println("Serial communication established");
   
   if (SERIAL_TEST_MODE) {
@@ -102,24 +94,30 @@ void setup() {
   LoRa.crc();                     // Enable CRC
   
   Serial.println("LoRa configured: SF7, BW125, CR4/5, Pwr20dBm");
-  Serial.println("Ground station operational");
+  
+  // Test LoRa module responsiveness
+  Serial.print(">>> LoRa module test - Frequency: ");
+  // Serial.print(LoRa.getFrequency());
+  Serial.println(" Hz");
+  Serial.print(">>> Spreading Factor: ");
+  // Serial.println(LoRa.getSpreadingFactor());
+  Serial.print(">>> Signal Bandwidth: ");
+  // Serial.println(LoRa.getSignalBandwidth());
+  
+  Serial.println("*** RX READY FOR LORA TEST ***");
+  Serial.println("*** Type PING to test LoRa transmission ***");
+  Serial.println("*** Watch TX serial monitor for reception ***");
   
   printGroundStationHelp();
-  currentMode = MODE_TELEMETRY;
 }
 
 void loop() {
   // Process user commands from serial
   processUserCommands();
   
-  // Handle LoRa state machine
+  // RX is now a pure command sender - no continuous telemetry
   if (!SERIAL_TEST_MODE) {
-    handleLoRaStateMachine();
-  }
-  
-  // Display telemetry in monitor mode  
-  if (currentMode == MODE_MONITOR) {
-    displayTelemetryDashboard();
+    handleCommandSending();
   }
   
   // Test mode heartbeat
@@ -138,31 +136,33 @@ void loop() {
 // === GROUND STATION FUNCTIONS ===
 
 void printGroundStationHelp() {
-  Serial.println("\n=== GROUND STATION COMMANDS ===");
-  Serial.println("TELEMETRY MODE:");
-  Serial.println("  MONITOR - Switch to live telemetry dashboard");
-  Serial.println("  QUIET - Switch to quiet telemetry mode");
+  Serial.println("\n=== LORA FLIGHT CONTROL COMMANDS ===");
+  Serial.println("Ground station sends commands to flight computer");
+  Serial.println("No response expected - check TX serial monitor");
   Serial.println("");
-  Serial.println("FLIGHT COMPUTER COMMANDS:");
-  Serial.println("  CMD <command> - Send command to flight computer");
-  Serial.println("  STATUS - Request flight computer status");
-  Serial.println("  CONFIG - Start flight configuration");
-  Serial.println("  START - Start data recording");
-  Serial.println("  STOP - Stop data recording"); 
-  Serial.println("  FILES - List files on flight computer");
-  Serial.println("  DOWNLOAD <filename> - Download file from flight computer");
+  Serial.println("FLIGHT CONTROL:");
+  Serial.println("  PING - Test LoRa connection");
+  Serial.println("  START - Begin flight configuration");
+  Serial.println("  STOP - Stop data recording");
+  Serial.println("  RESET - Reset sensor origins");
+  Serial.println("  STATUS - Get system status");
   Serial.println("");
-  Serial.println("PYRO COMMANDS (DANGER - USE WITH CAUTION):");
+  Serial.println("PYRO CHANNELS (USE WITH CAUTION!):");
   Serial.println("  PYRO1, PYRO2, PYRO3, PYRO4 - Fire pyro channels");
-  Serial.println("  ARM - Arm pyro system");
-  Serial.println("  DISARM - Disarm pyro system");
   Serial.println("");
-  Serial.println("SYSTEM COMMANDS:");
+  Serial.println("FLIGHT CONFIGURATION (after START):");
+  Serial.println("  FILENAME:test1 - Set log filename");
+  Serial.println("  WEIGHT:2.5 - Set total weight in kg");
+  Serial.println("  WIND:3.2 - Set wind speed in m/s");
+  Serial.println("  HEIGHT:100 - Set initial height in m");
+  Serial.println("  CONFIRM - Start recording with parameters");
+  Serial.println("  CANCEL - Cancel configuration");
+  Serial.println("");
+  Serial.println("SYSTEM:");
   Serial.println("  HELP - Show this help");
-  Serial.println("  RSSI - Show signal strength");
-  Serial.println("  PING - Test communication");
-  Serial.println("  SERIALTOGGLE - Toggle serial data output");
-  Serial.println("=====================================\n");
+  Serial.println("======================================\n");
+  Serial.println("Commands sent immediately when entered");
+  Serial.println("Watch TX serial monitor for reception!");
 }
 
 void processUserCommands() {
@@ -192,58 +192,56 @@ void processGroundStationCommand(String cmd) {
   
   Serial.print("Ground Station Command: "); Serial.println(cmd);
   
-  // Ground station mode commands
+  // Flight control commands
   if (cmd == "HELP") {
     printGroundStationHelp();
   }
-  else if (cmd == "MONITOR") {
-    currentMode = MODE_MONITOR;
-    Serial.println("Switched to MONITOR mode - Live telemetry dashboard");
-  }
-  else if (cmd == "QUIET" || cmd == "TELEMETRY") {
-    currentMode = MODE_TELEMETRY;
-    Serial.println("Switched to TELEMETRY mode - Quiet telemetry logging");
-  }
-  else if (cmd == "RSSI") {
-    showSignalStatus();
-  }
   else if (cmd == "PING") {
+    sendCommandToFlightComputer("PING");
+  }
+  else if (cmd == "START") {
+    Serial.println("=== STARTING FLIGHT CONFIGURATION ===");
+    Serial.println("Sending START command to TX...");
+    Serial.println("After TX responds, send these configuration commands:");
+    Serial.println("- FILENAME:your_test_name");
+    Serial.println("- WEIGHT:2.5 (kg)");
+    Serial.println("- WIND:3.0 (m/s)"); 
+    Serial.println("- HEIGHT:50 (meters)");
+    Serial.println("- CONFIRM (to start recording)");
+    Serial.println("======================================");
+    sendCommandToFlightComputer("START");
+  }
+  else if (cmd == "STOP") {
+    sendCommandToFlightComputer("STOP");
+  }
+  else if (cmd == "RESET") {
+    sendCommandToFlightComputer("RESET");
+  }
+  else if (cmd == "STATUS") {
     sendCommandToFlightComputer("STATUS");
   }
-  
-  // Direct flight computer commands
-  else if (cmd == "STATUS" || cmd == "CONFIG" || cmd == "START" || cmd == "STOP" || 
-           cmd == "FILES" || cmd == "SPACE" || cmd == "FORMAT") {
+  else if (cmd.startsWith("PYRO")) {
+    if (cmd == "PYRO1" || cmd == "PYRO2" || cmd == "PYRO3" || cmd == "PYRO4") {
+      sendPyroCommand(cmd);
+    } else {
+      Serial.println("ERROR: Invalid pyro command. Use PYRO1, PYRO2, PYRO3, or PYRO4");
+    }
+  }
+  else if (cmd.startsWith("FILENAME:") || cmd.startsWith("WEIGHT:") || 
+           cmd.startsWith("WIND:") || cmd.startsWith("HEIGHT:") || 
+           cmd == "CONFIRM" || cmd == "CANCEL") {
+    Serial.println("Sending flight configuration command: " + cmd);
     sendCommandToFlightComputer(cmd);
   }
-  else if (cmd.startsWith("DOWNLOAD ")) {
-    String filename = cmd.substring(9);
-    sendCommandToFlightComputer("DOWNLOAD " + filename);
-  }
-  else if (cmd.startsWith("DELETE ")) {
-    String filename = cmd.substring(7);
-    sendCommandToFlightComputer("DELETE " + filename);
-  }
-  else if (cmd.startsWith("CMD ")) {
-    String command = cmd.substring(4);
-    sendCommandToFlightComputer(command);
+  // Legacy test commands
+  else if (cmd == "HELLO" || cmd == "TEST") {
+    sendCommandToFlightComputer(cmd);
   }
   
-  // Pyro commands (high priority)
-  else if (cmd.startsWith("PYRO") && cmd.length() == 5) {
-    sendPyroCommand(cmd);
-  }
-  else if (cmd == "ARM") {
-    Serial.println("PYRO SYSTEM ARMED - DANGER: Pyro channels can now fire!");
-    // You could add additional arming logic here
-  }
-  else if (cmd == "DISARM") {
-    Serial.println("PYRO SYSTEM DISARMED - Safe mode");
-    // You could add additional disarming logic here
-  }
-  
+  // Any other command - just send it as-is for testing
   else {
-    Serial.println("ERROR: Unknown command. Type HELP for available commands.");
+    Serial.println("Sending custom command: " + cmd);
+    sendCommandToFlightComputer(cmd);
   }
 }
 
@@ -254,19 +252,8 @@ void sendCommandToFlightComputer(String command) {
     return;
   }
   
-  Serial.print("Sending to flight computer: ");
-  Serial.println(command);
-  
-  // Send command via LoRa
-  LoRa.beginPacket();
-  LoRa.print("CMD:" + command);
-  LoRa.endPacket();
-  
-  Serial.print("LoRa packet sent: CMD:");
-  Serial.println(command);
-  
-  commandPacketCount++;
-  lastCommandTime = millis();
+  // Send command immediately
+  pendingCommand = command;
 }
 
 void sendPyroCommand(String pyroCmd) {
@@ -301,28 +288,28 @@ void sendPyroCommand(String pyroCmd) {
   }
 }
 
-void handleLoRaCommunication() {
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    telemetryPacketCount++;
+void handleCommandSending() {
+  // SIMPLE TEST: Just send commands, don't wait for responses
+  
+  if (pendingCommand.length() > 0) {
+    Serial.println("===============================");
+    Serial.println("*** SENDING LORA COMMAND ***");
+    Serial.print("*** Command: ");
+    Serial.print(pendingCommand);
+    Serial.println(" ***");
     
-    // Read packet
-    String received = "";
-    while (LoRa.available()) {
-      received += (char)LoRa.read();
-    }
+    // Send the command
+    LoRa.beginPacket();
+    LoRa.print(pendingCommand);
+    LoRa.endPacket();
     
-    // Update connection status
-    flightComputerConnected = true;
-    lastTelemetryTime = millis();
+    Serial.println("*** LoRa packet sent! ***");
+    Serial.println("*** Check TX serial output ***");
+    Serial.println("===============================");
     
-    // Parse telemetry data
-    parseTelemetryPacket(received, LoRa.packetRssi());
-    
-    // Display based on current mode
-    if (currentMode == MODE_TELEMETRY) {
-      displayTelemetryLine(received, telemetryPacketCount, LoRa.packetRssi());
-    }
+    // Clear pending command
+    pendingCommand = "";
+    Serial.println(">>> Ready for next command");
   }
 }
 

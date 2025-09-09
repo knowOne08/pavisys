@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Compile TX Code",
+			"type": "shell",
+			"command": "echo",
+			"args": [
+				"TX_Pavi.ino ready for compilation in Arduino IDE"
+			],
+			"group": "build",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

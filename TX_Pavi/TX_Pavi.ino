@@ -34,18 +34,13 @@
 // SIMPLE RATE SELECTION - Choose your data rate
 #define DATA_RATE_MODE 1   // 1=10Hz, 2=20Hz, 3=30Hz, 4=40Hz
 
-// LORA TRANSMISSION CONTROL
-#define LORA_TRANSMISSION_MODE 1   // 0=OFF, 1=5Hz, 2=10Hz
+// LORA TRANSMISSION CONTROL - TX is now pure command responder
+#define LORA_TRANSMISSION_MODE 0   // TX never sends unsolicited telemetry
 
-// LoRa Communication States
-enum LoRaState {
-  LORA_NORMAL_MODE,     // TX sends telemetry, RX receives
-  LORA_COMMAND_MODE     // RX sends commands, TX listens
-};
-LoRaState loraState = LORA_NORMAL_MODE;
-unsigned long lastStateChange = 0;
-#define COMMAND_MODE_DURATION 3000  // 3 seconds for command mode
-#define NORMAL_MODE_DURATION 10000  // 10 seconds for normal mode
+// TX is always in receive mode, only responds to commands
+bool commandReceived = false;
+String lastCommand = "";
+unsigned long lastCommandTime = 0;
 
 // Sensor-specific rate limits (Hz)
 #define MAX_BARO_RATE 100     // MS5611 theoretical max  
@@ -76,6 +71,7 @@ struct FlightConfig {
 // Flight state management
 enum FlightState {
   FLIGHT_IDLE,           // Waiting for configuration
+  FLIGHT_CONFIGURING,    // Collecting configuration parameters
   FLIGHT_CONFIGURED,     // Configuration received, ready to start
   FLIGHT_RECORDING,      // Active data recording
   FLIGHT_STOPPED         // Recording stopped
@@ -162,28 +158,31 @@ const unsigned long loraTransmissionInterval = (LORA_TRANSMISSION_MODE == 0) ? 0
                                                (LORA_TRANSMISSION_MODE == 2) ? 100 : 0; // 10Hz (100ms)
 
 /* 
-=== SIMPLE CONFIGURATION ===
-Change DATA_RATE_MODE to switch between rates:
+=== SIMPLIFIED COMMAND/RESPONSE ARCHITECTURE ===
+TX (Flight Computer): Pure command responder
+- Never sends unsolicited telemetry
+- Always listens for LoRa commands
+- Only sends data when requested by RX
+- Continues sensor reading for local logging
 
-DATA RATE (sensor reading frequency):
+RX (Ground Station): Pure command sender  
+- Sends commands immediately when entered
+- Waits for responses with timeout
+- No continuous telemetry reception
+
+DATA RATE (sensor reading frequency for local logging):
 Mode 1 - 10Hz: 100ms interval, Load cell every 2nd cycle (5Hz)
 Mode 2 - 20Hz: 50ms interval,  Load cell every 3rd cycle (6.7Hz) 
 Mode 3 - 30Hz: 33ms interval,  Load cell every 4th cycle (7.5Hz)
 Mode 4 - 40Hz: 25ms interval,  Load cell every 5th cycle (8Hz)
-
-LORA TRANSMISSION (independent of sensor reading):
-Mode 0 - OFF: No LoRa transmission (local logging only)
-Mode 1 - 5Hz: LoRa transmit every 200ms
-Mode 2 - 10Hz: LoRa transmit every 100ms
-
-Higher sensor rates = more responsive IMU/Baro, LoRa rate controls telemetry
 */
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("=== Multi-Sensor LoRa Transmitter ===");
+  Serial.println("=== TX: LoRa Command Responder ===");
+  Serial.println("Pure command responder - no unsolicited telemetry");
   Serial.println("Sensors: MS5611 + MPU6050 + HX711 + 4x Pyro Channels");
   Serial.print("Barometer: "); Serial.println(ENABLE_BAROMETER ? "ON" : "OFF");
   Serial.print("Accelerometer: "); Serial.println(ENABLE_ACCELEROMETER ? "ON" : "OFF");
@@ -215,10 +214,14 @@ void setup() {
   // Initialize LoRa
   Serial.println("Initializing LoRa...");
   LoRa.setPins(NSS, RST, DIO0);
+  Serial.print(">>> Initializing LoRa on 433MHz...");
   if (!LoRa.begin(433E6)) {
-    Serial.println("LoRa init failed!");
+    Serial.println(" FAILED!");
+    Serial.println(">>> ERROR: LoRa initialization failed - check wiring");
+    return; // Don't continue if LoRa fails
   } else {
-    Serial.println("LoRa ready");
+    Serial.println(" SUCCESS!");
+    Serial.println(">>> LoRa module ready");
     
     // Configure LoRa settings for better compatibility
     LoRa.setSpreadingFactor(7);     // SF7 (faster data rate)
@@ -231,9 +234,21 @@ void setup() {
     
     Serial.println("LoRa configured: SF7, BW125, CR4/5, Pwr20dBm");
     
-    // Start in receive mode
+    // TX is pure command responder - always in receive mode
     LoRa.receive();
-    Serial.println("LoRa in receive mode");
+    Serial.println("*** TX READY FOR LORA TEST ***");
+    Serial.println("*** Waiting for LoRa packets from RX ***");
+    Serial.println("*** Send PING from RX to test ***");
+    
+    // Test LoRa module responsiveness
+    Serial.print(">>> LoRa module test - Frequency: ");
+    // Serial.print(LoRa.());
+    Serial.println(" Hz");
+    Serial.print(">>> Spreading Factor: ");
+    // Serial.println(LoRa.getSpreadingFactor());
+    Serial.print(">>> Signal Bandwidth: ");
+    // Serial.println(LoRa.getSignalBandwidth());
+    Serial.println(">>> If you see this, LoRa module is responsive");
   }
 
   // Initialize MS5611 Barometer
@@ -406,20 +421,10 @@ void setup() {
   Serial.print(sendInterval);
   Serial.println(" ms");
   
-  Serial.print("LoRa Transmission: ");
-  switch(LORA_TRANSMISSION_MODE) {
-    case 0:
-      Serial.println("*** OFF *** (Local logging only)");
-      break;
-    case 1:
-      Serial.println("*** 5 Hz *** (200ms interval)");
-      break;
-    case 2:
-      Serial.println("*** 10 Hz *** (100ms interval)");
-      break;
-    default:
-      Serial.println("*** OFF *** (default)");
-  }
+  Serial.println("LoRa Mode: *** COMMAND RESPONDER ONLY ***");
+  Serial.println("- TX never sends unsolicited telemetry");
+  Serial.println("- TX only responds to RX commands");
+  Serial.println("- RX sends commands and waits for responses");
   
   // Run pyro channel test if enabled
   if (PYRO_TEST_MODE) {
@@ -434,8 +439,15 @@ void loop() {
   // Process incoming serial commands
   processSerialCommands();
   
-  // Handle LoRa state management
-  handleLoRaStateMachine();
+  // TX is now a pure command responder - always listen for LoRa commands
+  handleLoRaCommands();
+  
+  // Read sensors periodically for local logging (no LoRa transmission)
+  static unsigned long lastSensorRead = 0;
+  if (millis() - lastSensorRead >= sendInterval) {
+    readSensorsOnly();
+    lastSensorRead = millis();
+  }
   
   // Log flight data if recording
   if (flightState == FLIGHT_RECORDING && enableDataLogging) {
@@ -827,6 +839,7 @@ void readSensorsWithSmartLoadCell() {
     Serial.print("Flight State: ");
     switch(flightState) {
       case FLIGHT_IDLE: Serial.println("IDLE - Waiting for configuration"); break;
+      case FLIGHT_CONFIGURING: Serial.println("CONFIGURING - Enter flight parameters"); break;
       case FLIGHT_CONFIGURED: Serial.println("CONFIGURED - Ready to start"); break;
       case FLIGHT_RECORDING: Serial.println("RECORDING - Flight in progress"); break;
       case FLIGHT_STOPPED: Serial.println("STOPPED - Flight completed"); break;
@@ -852,20 +865,26 @@ void readSensorsWithSmartLoadCell() {
       Serial.print("Samples Logged: "); Serial.println(sampleNumber);
     }
     
-    Serial.println("\n--- Available Commands ---");
+    Serial.println("\n--- TX: COMMAND RESPONDER MODE ---");
+    Serial.println("TX only responds to LoRa commands from RX");
+    Serial.println("No unsolicited telemetry transmission");
+    Serial.println("");
+    Serial.println("Available LoRa Commands (sent from RX):");
     Serial.println("PING - Test LoRa communication");
-    Serial.println("CONFIG - Configure flight parameters");
+    Serial.println("STATUS - Get flight computer status");
     Serial.println("START - Start data recording");
     Serial.println("STOP - Stop data recording");
-    Serial.println("STATUS - Show system status");
-    Serial.println("SERIALTOGGLE - Toggle serial data output");
     Serial.println("PYRO1, PYRO2, PYRO3, PYRO4 - Fire pyro channels");
+    Serial.println("");
+    Serial.println("Local Serial Commands:");
+    Serial.println("CONFIG - Configure flight parameters");
+    Serial.println("SERIALTOGGLE - Toggle serial data output");
     Serial.println("FILES - List all stored files");
     Serial.println("DOWNLOAD <filename> - Download file content");
     Serial.println("DELETE <filename> - Delete a file");
     Serial.println("SPACE - Show filesystem usage");
     Serial.println("FORMAT - Format filesystem (WARNING: deletes all data!)");
-    Serial.println("=====================================\n");
+    Serial.println("======================================\n");
     
   }
 
@@ -890,80 +909,36 @@ void readSensorsWithSmartLoadCell() {
     }
   }
 
-  void handleLoRaStateMachine() {
+  void handleLoRaCommands() {
     if (SERIAL_TEST_MODE) return; // Skip LoRa in test mode
     
-    unsigned long currentTime = millis();
-    
-    // State machine for LoRa communication
-    switch (loraState) {
-      case LORA_NORMAL_MODE:
-        // TX sends telemetry, check if time to switch to command mode
-        if (currentTime - lastStateChange > NORMAL_MODE_DURATION) {
-          switchToCommandMode();
-        } else {
-          handleNormalMode();
-        }
-        break;
-        
-      case LORA_COMMAND_MODE:
-        // TX listens for commands, check if time to switch back
-        if (currentTime - lastStateChange > COMMAND_MODE_DURATION) {
-          switchToNormalMode();
-        } else {
-          handleCommandMode();
-        }
-        break;
-    }
-  }
-
-  void switchToCommandMode() {
-    loraState = LORA_COMMAND_MODE;
-    lastStateChange = millis();
-    LoRa.receive(); // Switch to receive mode
-    Serial.println(">>> COMMAND MODE - Listening for commands");
-  }
-
-  void switchToNormalMode() {
-    loraState = LORA_NORMAL_MODE;
-    lastStateChange = millis();
-    Serial.println(">>> NORMAL MODE - Sending telemetry");
-  }
-
-  void handleNormalMode() {
-    // This is the existing telemetry transmission code
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastSend >= sendInterval) {
-      // ... existing sensor reading and transmission code ...
-      sendTelemetryData();
-    }
-  }
-
-  void handleCommandMode() {
-    // Listen for incoming commands
     int packetSize = LoRa.parsePacket();
-    if (packetSize) {
-      Serial.print("Command received, size: ");
-      Serial.println(packetSize);
+    if (packetSize > 0) {
+      Serial.println("*****************************");
+      Serial.println("*** LORA PACKET RECEIVED! ***");
+      Serial.print("*** Packet size: ");
+      Serial.print(packetSize);
+      Serial.println(" bytes ***");
       
       String received = "";
       while (LoRa.available()) {
         received += (char)LoRa.read();
       }
       
-      Serial.print("Command: ");
-      Serial.println(received);
+      Serial.print("*** Message: '");
+      Serial.print(received);
+      Serial.println("' ***");
+      Serial.print("*** RSSI: ");
+      Serial.print(LoRa.packetRssi());
+      Serial.println(" dBm ***");
+      Serial.println("*****************************");
       
-      // Process command and send response
-      String response = processCommandAndGetResponse(received);
+      // Process the command
+      received.trim();  // Trim the string in place
+      processLoRaCommand(received);
       
-      // Send response back
-      delay(100); // Small delay before responding
-      LoRa.beginPacket();
-      LoRa.print(response);
-      LoRa.endPacket();
-      Serial.print("Response sent: ");
-      Serial.println(response);
+      // Stay in receive mode
+      LoRa.receive();
     }
   }
 
@@ -972,6 +947,12 @@ void readSensorsWithSmartLoadCell() {
     cmd.trim();
     
     Serial.print("Command received: "); Serial.println(cmd);
+    
+    // Handle flight configuration commands when in FLIGHT_CONFIGURING state
+    if (flightState == FLIGHT_CONFIGURING) {
+      processFlightConfigCommand(cmd);
+      return;
+    }
     
     if (cmd == "PING") {
       Serial.println("PONG - LoRa command received successfully!");
@@ -1488,12 +1469,11 @@ void logPyroEvent(int channel) {
   }
 }
 
-void sendTelemetryData() {
+void readSensorsOnly() {
     unsigned long loopStart = micros();
-    lastSend = millis();
     sensorReadCount++;
     
-    // Read all sensors
+    // Read all sensors for local logging only
     unsigned long sensorStart = micros();
     readSensorsWithSmartLoadCell();
     unsigned long sensorTime = micros() - sensorStart;
@@ -1501,19 +1481,12 @@ void sendTelemetryData() {
     // Calculate vertical velocity
     calculateVerticalVelocity();
     
-    // Create telemetry packet
+    // Create data packet for serial output (no LoRa transmission)
     String packet = createDataPacket();
     
-    // Only transmit in normal mode
-    if (loraState == LORA_NORMAL_MODE && LORA_TRANSMISSION_MODE > 0) {
-      LoRa.beginPacket();
-      LoRa.print(packet);
-      LoRa.endPacket();
-    }
-    
-    // Print to serial if enabled
+    // Print to serial if enabled (for local monitoring)
     if (showSerialData) {
-      Serial.print("[TELEM] ");
+      Serial.print("[DATA] ");
       Serial.println(packet);
     }
   }
@@ -1562,5 +1535,175 @@ void sendTelemetryData() {
     }
     else {
       return "ERROR:UNKNOWN_COMMAND";
+    }
+  }
+
+  void processLoRaCommand(String cmd) {
+    cmd.toUpperCase();
+    cmd.trim();
+    
+    Serial.print(">>> Processing LoRa command: ");
+    Serial.println(cmd);
+    
+    // Handle flight configuration commands when in FLIGHT_CONFIGURING state
+    if (flightState == FLIGHT_CONFIGURING) {
+      Serial.println(">>> Flight configuration mode - processing config command");
+      processFlightConfigCommand(cmd);
+      return;
+    }
+    
+    if (cmd == "PING") {
+      Serial.println(">>> PING RECEIVED! TX is working! <<<");
+    }
+    else if (cmd == "START") {
+      if (flightState == FLIGHT_RECORDING) {
+        Serial.println(">>> ERROR: Already recording! Send STOP first.");
+      } else {
+        Serial.println(">>> START command received - configuring flight test");
+        promptForFlightConfiguration();
+      }
+    }
+    else if (cmd == "RESET") {
+      Serial.println(">>> RESET command received - resetting sensor origins");
+      resetSensorOrigins();
+      Serial.println(">>> Sensor origins reset complete");
+    }
+    else if (cmd == "STOP") {
+      if (flightState == FLIGHT_RECORDING) {
+        Serial.println(">>> STOP command received - stopping recording");
+        stopDataRecording();
+      } else {
+        Serial.println(">>> ERROR: Not currently recording");
+      }
+    }
+    else if (cmd == "PYRO1") {
+      Serial.println(">>> PYRO1 command received");
+      firePyroChannel(0);
+    }
+    else if (cmd == "PYRO2") {
+      Serial.println(">>> PYRO2 command received");
+      firePyroChannel(1);
+    }
+    else if (cmd == "PYRO3") {
+      Serial.println(">>> PYRO3 command received");
+      firePyroChannel(2);
+    }
+    else if (cmd == "PYRO4") {
+      Serial.println(">>> PYRO4 command received");
+      firePyroChannel(3);
+    }
+    else if (cmd == "STATUS") {
+      Serial.println(">>> STATUS command received");
+      printSystemStatus();
+    }
+    else {
+      Serial.print(">>> ERROR: Unknown LoRa command: ");
+      Serial.println(cmd);
+    }
+  }
+
+  void promptForFlightConfiguration() {
+    Serial.println("=== FLIGHT TEST CONFIGURATION ===");
+    Serial.println("TX now ready for flight configuration commands via LoRa!");
+    Serial.println("Send these commands from RX in any order:");
+    Serial.println("1. FILENAME:<name> - e.g., FILENAME:test1");
+    Serial.println("2. WEIGHT:<kg> - e.g., WEIGHT:2.5");
+    Serial.println("3. WIND:<m/s> - e.g., WIND:3.2");
+    Serial.println("4. HEIGHT:<m> - e.g., HEIGHT:100");
+    Serial.println("5. CONFIRM - Start recording with entered values");
+    Serial.println("6. CANCEL - Cancel configuration");
+    Serial.println("=====================================");
+    Serial.println(">>> WAITING FOR CONFIGURATION COMMANDS <<<");
+    
+    flightState = FLIGHT_CONFIGURING;
+    
+    // Initialize with defaults
+    flightConfig.filename = "flight_" + String(millis()) + ".csv";
+    flightConfig.totalWeight = 1.0;
+    flightConfig.windSpeed = 0.0;
+    flightConfig.initialHeight = 0.0;
+    
+    Serial.println("Current defaults:");
+    Serial.print("- Filename: "); Serial.println(flightConfig.filename);
+    Serial.print("- Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
+    Serial.print("- Wind: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
+    Serial.print("- Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
+    Serial.println("Send commands from RX to override defaults!");
+  }
+
+  void processFlightConfigCommand(String cmd) {
+    Serial.print(">>> Flight Config Command: "); Serial.println(cmd);
+    
+    if (cmd.startsWith("FILENAME:")) {
+      String filename = cmd.substring(9);
+      filename.trim();
+      if (filename.length() > 0) {
+        flightConfig.filename = filename + ".csv";
+        Serial.print("✓ Filename set to: "); Serial.println(flightConfig.filename);
+      } else {
+        Serial.println("ERROR: Invalid filename");
+      }
+    }
+    else if (cmd.startsWith("WEIGHT:")) {
+      String weightStr = cmd.substring(7);
+      weightStr.trim();
+      float weight = weightStr.toFloat();
+      if (weight > 0) {
+        flightConfig.totalWeight = weight;
+        Serial.print("✓ Weight set to: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
+      } else {
+        Serial.println("ERROR: Invalid weight value");
+      }
+    }
+    else if (cmd.startsWith("WIND:")) {
+      String windStr = cmd.substring(5);
+      windStr.trim();
+      float wind = windStr.toFloat();
+      if (wind >= 0) {
+        flightConfig.windSpeed = wind;
+        Serial.print("✓ Wind speed set to: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
+      } else {
+        Serial.println("ERROR: Invalid wind speed value");
+      }
+    }
+    else if (cmd.startsWith("HEIGHT:")) {
+      String heightStr = cmd.substring(7);
+      heightStr.trim();
+      float height = heightStr.toFloat();
+      flightConfig.initialHeight = height;
+      Serial.print("✓ Height set to: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
+    }
+    else if (cmd == "CONFIRM") {
+      Serial.println(">>> CONFIRM received! Starting flight recording...");
+      Serial.println("=== FINAL CONFIGURATION ===");
+      Serial.print("Filename: "); Serial.println(flightConfig.filename);
+      Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
+      Serial.print("Wind Speed: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");  
+      Serial.print("Initial Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
+      
+      flightConfig.startTime = millis();
+      flightState = FLIGHT_CONFIGURED;
+      Serial.println("✓ Configuration complete - starting data recording!");
+      
+      // Auto-start recording after confirmation
+      startDataRecording();
+    }
+    else if (cmd == "CANCEL") {
+      Serial.println(">>> Configuration cancelled. Returning to idle state.");
+      flightState = FLIGHT_IDLE;
+    }
+    else {
+      Serial.println("ERROR: Unknown config command. Use FILENAME:, WEIGHT:, WIND:, HEIGHT:, CONFIRM, or CANCEL");
+    }
+    
+    // Show current configuration status
+    if (flightState == FLIGHT_CONFIGURING) {
+      Serial.println("\n--- Current Configuration ---");
+      Serial.print("Filename: "); Serial.println(flightConfig.filename);
+      Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
+      Serial.print("Wind: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
+      Serial.print("Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
+      Serial.println("Send CONFIRM when ready, or more parameter commands to change values");
+      Serial.println(">>> WAITING FOR NEXT COMMAND <<<");
     }
   }
