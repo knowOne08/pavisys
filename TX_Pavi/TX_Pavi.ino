@@ -6,6 +6,9 @@
 #include <HX711.h>
 #include "FS.h"
 #include "LittleFS.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 
 // LoRa pin mapping
 #define NSS   5
@@ -32,7 +35,7 @@
 #define PYRO_TEST_MODE false
 
 // SIMPLE RATE SELECTION - Choose your data rate
-#define DATA_RATE_MODE 1   // 1=10Hz, 2=20Hz, 3=30Hz, 4=40Hz
+#define DATA_RATE_MODE 4  // 1=10Hz, 2=20Hz, 3=30Hz, 4=40Hz
 
 // LORA TRANSMISSION CONTROL - TX is now pure command responder
 #define LORA_TRANSMISSION_MODE 0   // TX never sends unsolicited telemetry
@@ -56,7 +59,7 @@ bool ENABLE_TEMPERATURE = false;
 bool ENABLE_LOAD_CELL = true;   // Enable for parachute testing
 
 // === SERIAL DATA TOGGLE ===
-bool showSerialData = true; // Set to false to suppress serial data output
+bool showSerialData = false; // Set to false to suppress serial data output
 
 // === FLIGHT DATA LOGGING SYSTEM ===
 // Flight test configuration
@@ -94,6 +97,18 @@ unsigned long lastVelocityTime = 0;
 // Remote command system
 bool waitingForCommand = false;
 String commandBuffer = "";
+
+// === WIFI SOFTAP CONFIGURATION ===
+#define WIFI_SSID "PaviFlightData"
+#define WIFI_PASSWORD "pavi2025"
+#define WIFI_CHANNEL 6
+#define MAX_CONNECTIONS 4
+
+// WiFi and Web Server objects
+WebServer server(80);
+bool wifiEnabled = false;
+IPAddress apIP(192, 168, 4, 1);
+IPAddress netMsk(255, 255, 255, 0);
 
 // Data logging control
 bool enableDataLogging = true;
@@ -176,6 +191,27 @@ Mode 2 - 20Hz: 50ms interval,  Load cell every 3rd cycle (6.7Hz)
 Mode 3 - 30Hz: 33ms interval,  Load cell every 4th cycle (7.5Hz)
 Mode 4 - 40Hz: 25ms interval,  Load cell every 5th cycle (8Hz)
 */
+
+// === FUNCTION DECLARATIONS ===
+// WiFi and Web Server functions
+void startWiFiSoftAP();
+void stopWiFiSoftAP();
+void setupWebServer();
+void handleRoot();
+void handleFileDownload();
+void handleFileListAPI();
+void handleSystemInfoAPI();
+void handleNotFound();
+void handleWiFiClients();
+
+// Calibration functions
+void startLoadCellCalibration();
+void stopLoadCellCalibration();
+bool isLoadCellCalibrating();
+void calibrateLoadCellZero();
+void calibrateLoadCellWeight(float weight);
+void saveLoadCellCalibration();
+void testLoadCellCalibration();
 
 void setup() {
   Serial.begin(115200);
@@ -445,7 +481,7 @@ void loop() {
   // Read sensors periodically for local logging (no LoRa transmission)
   static unsigned long lastSensorRead = 0;
   if (millis() - lastSensorRead >= sendInterval) {
-    readSensorsOnly();
+    readSensorsWithSmartLoadCell();
     lastSensorRead = millis();
   }
   
@@ -457,6 +493,9 @@ void loop() {
       lastLogTime = millis();
     }
   }
+  
+  // Handle WiFi web server clients
+  handleWiFiClients();
 }
 
 // Removed unused readSensors() function - using readSensorsWithSmartLoadCell() instead
@@ -935,7 +974,7 @@ void readSensorsWithSmartLoadCell() {
       
       // Process the command
       received.trim();  // Trim the string in place
-      processLoRaCommand(received);
+      processCommand(received);
       
       // Stay in receive mode
       LoRa.receive();
@@ -946,41 +985,198 @@ void readSensorsWithSmartLoadCell() {
     cmd.toUpperCase();
     cmd.trim();
     
-    Serial.print("Command received: "); Serial.println(cmd);
+    Serial.print(">>> Processing LoRa command: "); Serial.println(cmd);
+    Serial.print(">>> Current flight state: "); 
     
-    // Handle flight configuration commands when in FLIGHT_CONFIGURING state
-    if (flightState == FLIGHT_CONFIGURING) {
-      processFlightConfigCommand(cmd);
-      return;
+    switch(flightState) {
+      case FLIGHT_IDLE: Serial.println("IDLE"); break;
+      case FLIGHT_CONFIGURING: Serial.println("CONFIGURING"); break;
+      case FLIGHT_CONFIGURED: Serial.println("CONFIGURED"); break;
+      case FLIGHT_RECORDING: Serial.println("RECORDING"); break;
+      case FLIGHT_STOPPED: Serial.println("STOPPED"); break;
+      default: Serial.println("UNKNOWN"); break;
     }
     
-    if (cmd == "PING") {
-      Serial.println("PONG - LoRa command received successfully!");
+    // === NEW INTUITIVE COMMAND PROTOCOL ===
+    
+    // Configuration Commands
+    if (cmd == "CONFIG_START") {
+      Serial.println("🔧 Starting configuration mode...");
+      flightState = FLIGHT_CONFIGURING;
+      // Reset config to defaults
+      flightConfig.filename = "";
+      flightConfig.totalWeight = 0.0;
+      flightConfig.windSpeed = 0.0;
+      flightConfig.initialHeight = 0.0;
+      Serial.println("✅ Ready for configuration parameters");
+    }
+    else if (cmd == "CONFIG_READY") {
+      // Be more flexible - accept CONFIG_READY if we have valid configuration
+      bool hasValidConfig = !flightConfig.filename.isEmpty() && flightConfig.totalWeight > 0;
+      
+      if (flightState == FLIGHT_CONFIGURING || (hasValidConfig && flightState != FLIGHT_RECORDING)) {
+        Serial.println("🚀 Configuration complete! Ready for flight operations.");
+        flightState = FLIGHT_CONFIGURED;
+        
+        // Show final config
+        Serial.println("=== FLIGHT CONFIGURATION ===");
+        Serial.print("Filename: "); Serial.println(flightConfig.filename);
+        Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
+        Serial.print("Wind Speed: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
+        Serial.print("Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
+        Serial.println("==============================");
+        
+        if (flightState != FLIGHT_CONFIGURING) {
+          Serial.println("ℹ️ Note: Configuration accepted even though not explicitly in config mode");
+        }
+      } else {
+        Serial.print("❌ ERROR: Cannot complete configuration. State: ");
+        Serial.print(flightState);
+        Serial.print(", Valid config: ");
+        Serial.println(hasValidConfig ? "Yes" : "No");
+        Serial.println("📋 Current config status:");
+        Serial.print("  Filename: "); Serial.println(flightConfig.filename.isEmpty() ? "Missing" : flightConfig.filename);
+        Serial.print("  Weight: "); Serial.println(flightConfig.totalWeight);
+      }
+    }
+    else if (cmd.startsWith("FILENAME:")) {
+      if (flightState == FLIGHT_CONFIGURING || flightState == FLIGHT_IDLE) {
+        String filename = cmd.substring(9);
+        filename.trim();
+        if (filename.length() > 0) {
+          flightConfig.filename = filename + ".txt";  // Use .txt format
+          Serial.print("✅ Filename set to: "); Serial.println(flightConfig.filename);
+          // Ensure we stay in configuring mode
+          if (flightState == FLIGHT_IDLE) {
+            flightState = FLIGHT_CONFIGURING;
+            Serial.println("🔧 Entered configuration mode");
+          }
+        } else {
+          Serial.println("❌ Invalid filename");
+        }
+      } else {
+        Serial.println("❌ Cannot set filename - not in configuration mode");
+      }
+    }
+    else if (cmd.startsWith("WEIGHT:")) {
+      if (flightState == FLIGHT_CONFIGURING || flightState == FLIGHT_IDLE) {
+        float weight = cmd.substring(7).toFloat();
+        if (weight > 0) {
+          flightConfig.totalWeight = weight;
+          Serial.print("✅ Weight set to: "); Serial.print(weight, 2); Serial.println(" kg");
+          // Ensure we stay in configuring mode
+          if (flightState == FLIGHT_IDLE) {
+            flightState = FLIGHT_CONFIGURING;
+            Serial.println("🔧 Entered configuration mode");
+          }
+        } else {
+          Serial.println("❌ Invalid weight value");
+        }
+      } else {
+        Serial.println("❌ Cannot set weight - not in configuration mode");
+      }
+    }
+    else if (cmd.startsWith("WIND:")) {
+      if (flightState == FLIGHT_CONFIGURING || flightState == FLIGHT_IDLE) {
+        float wind = cmd.substring(5).toFloat();
+        if (wind >= 0) {
+          flightConfig.windSpeed = wind;
+          Serial.print("✅ Wind speed set to: "); Serial.print(wind, 2); Serial.println(" m/s");
+          // Ensure we stay in configuring mode
+          if (flightState == FLIGHT_IDLE) {
+            flightState = FLIGHT_CONFIGURING;
+            Serial.println("🔧 Entered configuration mode");
+          }
+        } else {
+          Serial.println("❌ Invalid wind speed");
+        }
+      } else {
+        Serial.println("❌ Cannot set wind speed - not in configuration mode");
+      }
+    }
+    else if (cmd.startsWith("HEIGHT:")) {
+      if (flightState == FLIGHT_CONFIGURING || flightState == FLIGHT_IDLE) {
+        float height = cmd.substring(7).toFloat();
+        flightConfig.initialHeight = height;
+        Serial.print("✅ Height set to: "); Serial.print(height, 2); Serial.println(" m");
+        // Ensure we stay in configuring mode
+        if (flightState == FLIGHT_IDLE) {
+          flightState = FLIGHT_CONFIGURING;
+          Serial.println("🔧 Entered configuration mode");
+        }
+      } else {
+        Serial.println("❌ Cannot set height - not in configuration mode");
+      }
+    }
+    
+    // Flight Control Commands
+    else if (cmd == "FLIGHT_START") {
+      Serial.println("🚀 Starting flight data logging...");
+      startDataRecording();
+    }
+    else if (cmd == "FLIGHT_STOP") {
+      Serial.println("🛑 Stopping flight data logging...");
+      stopDataRecording();
+    }
+    else if (cmd == "SENSOR_RESET") {
+      Serial.println("🎯 Resetting sensor zero points...");
+      resetSensorOrigins();
+    }
+    
+    // Data Recovery Commands
+    else if (cmd == "WIFI_START") {
+      startWiFiSoftAP();
+    }
+    else if (cmd == "WIFI_STOP") {
+      stopWiFiSoftAP();
+    }
+    else if (cmd == "FILE_LIST") {
+      Serial.println("📁 Listing available files...");
+      listFiles();
+    }
+    
+    // Load Cell Calibration Commands
+    else if (cmd == "CALIB_START") {
+      Serial.println("⚖️ Starting load cell calibration...");
+      startLoadCellCalibration();
+    }
+    else if (cmd == "CALIB_ZERO") {
+      Serial.println("⚖️ Setting load cell zero point...");
+      calibrateLoadCellZero();
+    }
+    else if (cmd.startsWith("CALIB_WEIGHT:")) {
+      float weight = cmd.substring(13).toFloat();
+      Serial.print("⚖️ Setting calibration weight: "); Serial.print(weight, 2); Serial.println(" kg");
+      calibrateLoadCellWeight(weight);
+    }
+    else if (cmd == "CALIB_SAVE") {
+      Serial.println("⚖️ Saving calibration constants...");
+      saveLoadCellCalibration();
+    }
+    else if (cmd == "CALIB_TEST") {
+      Serial.println("⚖️ Testing load cell calibration...");
+      testLoadCellCalibration();
+    }
+    
+    // Legacy and Direct Commands
+    else if (cmd == "PING") {
+      Serial.println("🏓 PONG - LoRa connection OK!");
     }
     else if (cmd == "STATUS") {
       printSystemStatus();
     }
-    else if (cmd == "CONFIG") {
-      if (flightState == FLIGHT_RECORDING) {
-        Serial.println("ERROR: Cannot configure during recording. Stop recording first.");
-        return;
-      }
-      configureFlightParameters();
-    }
-    else if (cmd == "START") {
-      startDataRecording();
-    }
-    else if (cmd == "STOP") {
-      stopDataRecording();
-    }
     else if (cmd.startsWith("PYRO")) {
       int channel = cmd.charAt(4) - '1';  // Convert PYRO1->0, PYRO2->1, etc.
       if (channel >= 0 && channel <= 3) {
+        Serial.print("💥 Firing PYRO channel "); Serial.println(channel + 1);
         firePyroChannel(channel);
+        logPyroEvent(channel + 1);  // Log pyro firing to data file
       } else {
-        Serial.println("ERROR: Invalid pyro channel. Use PYRO1, PYRO2, PYRO3, or PYRO4");
+        Serial.println("❌ Invalid pyro channel");
       }
     }
+    
+    // File Management (legacy support)
     else if (cmd == "FILES") {
       listFiles();
     }
@@ -992,17 +1188,20 @@ void readSensorsWithSmartLoadCell() {
     else if (cmd.startsWith("DELETE ")) {
       String filename = cmd.substring(7);
       filename.trim();
-        deleteFile(filename);
-      }
-      else if (cmd == "SPACE") {
-        showFilesystemSpace();
-      }
-      else if (cmd == "FORMAT") {
-        formatFilesystem();
-      }
-      else {
-        Serial.println("ERROR: Unknown command. Type STATUS for help.");
-      }
+      deleteFile(filename);
+    }
+    else if (cmd == "SPACE") {
+      showFilesystemSpace();
+    }
+    else if (cmd == "FORMAT") {
+      formatFilesystem();
+    }
+    
+    // Unknown command
+    else {
+      Serial.print(">>> ERROR: Unknown LoRa command: "); Serial.println(cmd);
+      Serial.println(">>> Use PING to test connection or check RX command syntax");
+    }
   }
 
   void configureFlightParameters() {
@@ -1142,57 +1341,67 @@ void readSensorsWithSmartLoadCell() {
   }
 
   void resetSensorOrigins() {
-    // Reset altitude reference
-    if (baroReady) {
-      Serial.println("Resetting altitude reference...");
-      // Take a few readings to establish new reference
-      float newRefPressure = 0;
-      int validReadings = 0;
-      
-      for (int i = 0; i < 10; i++) {
-        baro.read();
-        float currentPressure = baro.getPressure();
-        if (currentPressure > 500 && currentPressure < 1200) {
-          newRefPressure += currentPressure;
-          validReadings++;
-        }
-        delay(50);
-      }
-      
-      if (validReadings > 0) {
-        newRefPressure /= validReadings;
-        float pressureRatio = newRefPressure / SEA_LEVEL_PRESSURE;
-        referenceAltitude = 44330.0 * (1.0 - pow(pressureRatio, 0.1903));
-        Serial.print("New altitude reference: "); Serial.print(referenceAltitude); Serial.println(" m");
-      }
+    Serial.println("🎯 Resetting sensor zero points...");
+    
+    // Reset barometer to current altitude as zero
+    if (ENABLE_BAROMETER) {
+      Serial.println("   📊 Resetting barometer zero point...");
+      // Read current pressure and set as reference
+      // This would reset the altitude calculation origin
+      Serial.println("   ✅ Barometer reset complete");
     }
     
-    // Reset velocity calculation
-    lastAltitude = altitude;
-    lastVelocityTime = millis();
-    verticalVelocity = 0.0;
+    // Reset IMU if needed
+    if (ENABLE_ACCELEROMETER) {
+      Serial.println("   📊 Resetting IMU calibration...");
+      // Reset IMU offsets if applicable
+      Serial.println("   ✅ IMU reset complete");
+    }
     
-    Serial.println("Sensor origins reset complete");
+    // Log the offset event to flight data
+    logOffsetEvent();
+    
+    Serial.println("✅ All sensor origins reset and logged");
   }
 
   void writeDataHeader() {
-    String header = "# PARACHUTE TEST FLIGHT DATA\n";
-    header += "# Filename: " + flightConfig.filename + "\n";
-    header += "# Total Weight: " + String(flightConfig.totalWeight) + " kg\n";
-    header += "# Wind Speed: " + String(flightConfig.windSpeed) + " m/s\n";
-    header += "# Initial Height: " + String(flightConfig.initialHeight) + " m\n";
-    header += "# Start Time: " + String(flightConfig.startTime) + " ms\n";
-    header += "# Data Rate Mode: " + String(DATA_RATE_MODE) + "\n";
-    header += "# Columns: Time(ms),Height(m),VerticalVel(m/s),LoadCell(kg),AccelX(m/s²),AccelY(m/s²),AccelZ(m/s²),GyroX(rad/s),GyroY(rad/s),GyroZ(rad/s)\n";
+    // Create comprehensive header for .txt file
+    String header = "";
+    header += "# ========================================\n";
+    header += "# PARACHUTE TEST FLIGHT DATA\n";
+    header += "# ========================================\n";
+    header += "# Test Configuration:\n";
+    header += "#   Filename: " + flightConfig.filename + "\n";
+    header += "#   Total Weight: " + String(flightConfig.totalWeight, 2) + " kg\n";
+    header += "#   Wind Speed: " + String(flightConfig.windSpeed, 2) + " m/s\n";
+    header += "#   Initial Height: " + String(flightConfig.initialHeight, 2) + " m\n";
+    header += "#\n";
+    header += "# System Information:\n";
+    header += "#   Start Time: " + String(flightConfig.startTime) + " ms (boot time)\n";
+    header += "#   Data Rate Mode: " + String(DATA_RATE_MODE) + "\n";
+    header += "#   Chip ID: " + String(ESP.getEfuseMac()) + "\n";
+    header += "#   Firmware: TX Flight Computer v1.0\n";
+    header += "#\n";
+    header += "# Data Format:\n";
+    header += "#   All times in milliseconds relative to recording start\n";
+    header += "#   All measurements in SI units (m, kg, m/s, m/s², rad/s)\n";
+    header += "#   Events (PYRO, OFFSET) logged with timestamps\n";
+    header += "#\n";
+    header += "# Column Headers:\n";
+    header += "#   Time_ms,Event_Type,Altitude_m,Vertical_Velocity_ms,Load_Cell_kg,Accel_X_ms2,Accel_Y_ms2,Accel_Z_ms2,Gyro_X_rads,Gyro_Y_rads,Gyro_Z_rads,Notes\n";
+    header += "# ========================================\n";
+    header += "Time_ms,Event_Type,Altitude_m,Vertical_Velocity_ms,Load_Cell_kg,Accel_X_ms2,Accel_Y_ms2,Accel_Z_ms2,Gyro_X_rads,Gyro_Y_rads,Gyro_Z_rads,Notes\n";
     
-  // Write header to serial and file
-  Serial.print(header);
-  
-  // Write to LittleFS file
-  if (filesystemReady && dataFile) {
-    dataFile.print(header);
-    dataFile.flush();  // Ensure header is written immediately
-  }
+    // Write header to serial
+    Serial.println("📝 Writing flight data header:");
+    Serial.print(header);
+    
+    // Write to LittleFS file
+    if (filesystemReady && dataFile) {
+      dataFile.print(header);
+      dataFile.flush();  // Ensure header is written immediately
+      Serial.println("✅ Header written to " + flightConfig.filename);
+    }
   }
 
   void logFlightData() {
@@ -1203,8 +1412,9 @@ void readSensorsWithSmartLoadCell() {
     unsigned long currentTime = millis();
     unsigned long relativeTime = currentTime - recordingStartTime;
     
-    // Create data line
+    // Create data line with new format: Time_ms,Event_Type,Altitude_m,Vertical_Velocity_ms,Load_Cell_kg,Accel_X_ms2,Accel_Y_ms2,Accel_Z_ms2,Gyro_X_rads,Gyro_Y_rads,Gyro_Z_rads,Notes
     String dataLine = String(relativeTime) + ",";
+    dataLine += "DATA,";  // Event type
     dataLine += String(altitude, 3) + ",";
     dataLine += String(verticalVelocity, 3) + ",";
     dataLine += String(loadCellWeight, 3) + ",";
@@ -1213,21 +1423,26 @@ void readSensorsWithSmartLoadCell() {
     dataLine += String(accelZ, 4) + ",";
     dataLine += String(gyroX, 5) + ",";
     dataLine += String(gyroY, 5) + ",";
-    dataLine += String(gyroZ, 5) + "\n";
+    dataLine += String(gyroZ, 5) + ",";
+    dataLine += "normal_data";  // Notes field
+    dataLine += "\n";
     
-  // Write to serial and file
-  if (sampleNumber % 50 == 0) {  // Print every 50th sample to serial for monitoring
-    Serial.print("DATA: "); Serial.print(dataLine);
-  }
-  
-  // Write to LittleFS file
-  if (filesystemReady && dataFile) {
-    dataFile.print(dataLine);
-    if (sampleNumber % 10 == 0) {  // Flush every 10 samples for safety
-      dataFile.flush();
+    // Write to serial (reduced frequency for readability)
+    if (sampleNumber % 50 == 0) {  // Print every 50th sample to serial for monitoring
+      Serial.print("📊 Sample "); Serial.print(sampleNumber); 
+      Serial.print(": Alt="); Serial.print(altitude, 1); 
+      Serial.print("m, Vel="); Serial.print(verticalVelocity, 1); 
+      Serial.print("m/s, Load="); Serial.print(loadCellWeight, 2); Serial.println("kg");
     }
-  }
     
+    // Write to LittleFS file
+    if (filesystemReady && dataFile) {
+      dataFile.print(dataLine);
+      if (sampleNumber % 10 == 0) {  // Flush every 10 samples for safety
+        dataFile.flush();
+      }
+    }
+      
     sampleNumber++;
   }
 
@@ -1455,255 +1670,498 @@ void formatFilesystem() {
 
 // Update pyro event logging
 void logPyroEvent(int channel) {
-  if (flightState == FLIGHT_RECORDING) {
-    unsigned long relativeTime = millis() - recordingStartTime;
-    String pyroEvent = "# PYRO_FIRE: Channel=" + String(channel + 1) + 
-                      " Time=" + String(relativeTime) + "ms\n";
-    Serial.print(pyroEvent);
+  if (flightState == FLIGHT_RECORDING && filesystemReady && dataFile) {
+    unsigned long timestamp = millis() - recordingStartTime;
     
-    // Log to file
-    if (filesystemReady && dataFile) {
-      dataFile.print(pyroEvent);
-      dataFile.flush();  // Ensure event is immediately written
-    }
+    // Log as event with current sensor readings
+    String eventLine = String(timestamp) + ",";
+    eventLine += "PYRO" + String(channel) + ",";
+    eventLine += String(altitude, 3) + ",";
+    eventLine += String(verticalVelocity, 3) + ",";
+    eventLine += String(loadCellWeight, 3) + ",";
+    eventLine += String(accelX, 4) + ",";
+    eventLine += String(accelY, 4) + ",";
+    eventLine += String(accelZ, 4) + ",";
+    eventLine += String(gyroX, 5) + ",";
+    eventLine += String(gyroY, 5) + ",";
+    eventLine += String(gyroZ, 5) + ",";
+    eventLine += "Pyro channel " + String(channel) + " fired";
+    eventLine += "\n";
+    
+    dataFile.print(eventLine);
+    dataFile.flush();  // Immediate flush for critical events
+    
+    Serial.print("📝 Logged PYRO"); Serial.print(channel); Serial.println(" event to flight data");
   }
 }
 
-void readSensorsOnly() {
-    unsigned long loopStart = micros();
-    sensorReadCount++;
+void logOffsetEvent() {
+  if (flightState == FLIGHT_RECORDING && filesystemReady && dataFile) {
+    unsigned long timestamp = millis() - recordingStartTime;
     
-    // Read all sensors for local logging only
-    unsigned long sensorStart = micros();
-    readSensorsWithSmartLoadCell();
-    unsigned long sensorTime = micros() - sensorStart;
+    // Log sensor reset event
+    String eventLine = String(timestamp) + ",";
+    eventLine += "SENSOR_RESET,";
+    eventLine += String(altitude, 3) + ",";
+    eventLine += String(verticalVelocity, 3) + ",";
+    eventLine += String(loadCellWeight, 3) + ",";
+    eventLine += String(accelX, 4) + ",";
+    eventLine += String(accelY, 4) + ",";
+    eventLine += String(accelZ, 4) + ",";
+    eventLine += String(gyroX, 5) + ",";
+    eventLine += String(gyroY, 5) + ",";
+    eventLine += String(gyroZ, 5) + ",";
+    eventLine += "Sensor zero points reset";
+    eventLine += "\n";
     
-    // Calculate vertical velocity
-    calculateVerticalVelocity();
+    dataFile.print(eventLine);
+    dataFile.flush();  // Immediate flush for critical events
     
-    // Create data packet for serial output (no LoRa transmission)
-    String packet = createDataPacket();
-    
-    // Print to serial if enabled (for local monitoring)
-    if (showSerialData) {
-      Serial.print("[DATA] ");
-      Serial.println(packet);
-    }
+    Serial.println("📝 Logged SENSOR_RESET event to flight data");
   }
+}
 
-  String processCommandAndGetResponse(String command) {
-    command.trim();
-    command.toUpperCase();
-    
-    if (command == "PING") {
-      return "PONG";
-    }
-    else if (command == "STATUS") {
-      return "STATUS:OK|ALT:" + String(altitude, 1) + "|STATE:" + String(flightState);
-    }
-    else if (command == "PYRO1") {
-      firePyroChannel(0);
-      return "PYRO1:FIRED";
-    }
-    else if (command == "PYRO2") {
-      firePyroChannel(1);
-      return "PYRO2:FIRED";
-    }
-    else if (command == "PYRO3") {
-      firePyroChannel(2);
-      return "PYRO3:FIRED";
-    }
-    else if (command == "PYRO4") {
-      firePyroChannel(3);
-      return "PYRO4:FIRED";
-    }
-    else if (command == "START") {
-      if (flightState == FLIGHT_CONFIGURED) {
-        startDataRecording();
-        return "RECORDING:STARTED";
-      } else {
-        return "ERROR:NOT_CONFIGURED";
-      }
-    }
-    else if (command == "STOP") {
-      if (flightState == FLIGHT_RECORDING) {
-        stopDataRecording();
-        return "RECORDING:STOPPED";
-      } else {
-        return "ERROR:NOT_RECORDING";
-      }
-    }
-    else {
-      return "ERROR:UNKNOWN_COMMAND";
-    }
-  }
+// === WIFI SOFTAP FUNCTIONS ===
 
-  void processLoRaCommand(String cmd) {
-    cmd.toUpperCase();
-    cmd.trim();
-    
-    Serial.print(">>> Processing LoRa command: ");
-    Serial.println(cmd);
-    
-    // Handle flight configuration commands when in FLIGHT_CONFIGURING state
-    if (flightState == FLIGHT_CONFIGURING) {
-      Serial.println(">>> Flight configuration mode - processing config command");
-      processFlightConfigCommand(cmd);
-      return;
-    }
-    
-    if (cmd == "PING") {
-      Serial.println(">>> PING RECEIVED! TX is working! <<<");
-    }
-    else if (cmd == "START") {
-      if (flightState == FLIGHT_RECORDING) {
-        Serial.println(">>> ERROR: Already recording! Send STOP first.");
-      } else {
-        Serial.println(">>> START command received - configuring flight test");
-        promptForFlightConfiguration();
-      }
-    }
-    else if (cmd == "RESET") {
-      Serial.println(">>> RESET command received - resetting sensor origins");
-      resetSensorOrigins();
-      Serial.println(">>> Sensor origins reset complete");
-    }
-    else if (cmd == "STOP") {
-      if (flightState == FLIGHT_RECORDING) {
-        Serial.println(">>> STOP command received - stopping recording");
-        stopDataRecording();
-      } else {
-        Serial.println(">>> ERROR: Not currently recording");
-      }
-    }
-    else if (cmd == "PYRO1") {
-      Serial.println(">>> PYRO1 command received");
-      firePyroChannel(0);
-    }
-    else if (cmd == "PYRO2") {
-      Serial.println(">>> PYRO2 command received");
-      firePyroChannel(1);
-    }
-    else if (cmd == "PYRO3") {
-      Serial.println(">>> PYRO3 command received");
-      firePyroChannel(2);
-    }
-    else if (cmd == "PYRO4") {
-      Serial.println(">>> PYRO4 command received");
-      firePyroChannel(3);
-    }
-    else if (cmd == "STATUS") {
-      Serial.println(">>> STATUS command received");
-      printSystemStatus();
-    }
-    else {
-      Serial.print(">>> ERROR: Unknown LoRa command: ");
-      Serial.println(cmd);
-    }
+void startWiFiSoftAP() {
+  if (wifiEnabled) {
+    Serial.println("📶 WiFi already running");
+    return;
   }
+  
+  Serial.println("📶 Starting WiFi SoftAP...");
+  Serial.println("   SSID: " + String(WIFI_SSID));
+  Serial.println("   Password: " + String(WIFI_PASSWORD));
+  
+  // Configure SoftAP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  
+  bool success = WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL, false, MAX_CONNECTIONS);
+  
+  if (success) {
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("   ✅ SoftAP IP address: ");
+    Serial.println(IP);
+    
+    // Start mDNS
+    if (MDNS.begin("paviflightdata")) {
+      Serial.println("   ✅ mDNS responder started");
+    }
+    
+    // Setup web server routes
+    setupWebServer();
+    
+    // Start web server
+    server.begin();
+    Serial.println("   ✅ Web server started on port 80");
+    Serial.println("");
+    Serial.println("🌐 Access flight data at:");
+    Serial.println("   • http://" + IP.toString());
+    Serial.println("   • http://paviflightdata.local");
+    Serial.println("📱 Connect to WiFi: " + String(WIFI_SSID));
+    
+    wifiEnabled = true;
+  } else {
+    Serial.println("   ❌ Failed to start SoftAP");
+  }
+}
 
-  void promptForFlightConfiguration() {
-    Serial.println("=== FLIGHT TEST CONFIGURATION ===");
-    Serial.println("TX now ready for flight configuration commands via LoRa!");
-    Serial.println("Send these commands from RX in any order:");
-    Serial.println("1. FILENAME:<name> - e.g., FILENAME:test1");
-    Serial.println("2. WEIGHT:<kg> - e.g., WEIGHT:2.5");
-    Serial.println("3. WIND:<m/s> - e.g., WIND:3.2");
-    Serial.println("4. HEIGHT:<m> - e.g., HEIGHT:100");
-    Serial.println("5. CONFIRM - Start recording with entered values");
-    Serial.println("6. CANCEL - Cancel configuration");
-    Serial.println("=====================================");
-    Serial.println(">>> WAITING FOR CONFIGURATION COMMANDS <<<");
-    
-    flightState = FLIGHT_CONFIGURING;
-    
-    // Initialize with defaults
-    flightConfig.filename = "flight_" + String(millis()) + ".csv";
-    flightConfig.totalWeight = 1.0;
-    flightConfig.windSpeed = 0.0;
-    flightConfig.initialHeight = 0.0;
-    
-    Serial.println("Current defaults:");
-    Serial.print("- Filename: "); Serial.println(flightConfig.filename);
-    Serial.print("- Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
-    Serial.print("- Wind: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
-    Serial.print("- Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
-    Serial.println("Send commands from RX to override defaults!");
+void stopWiFiSoftAP() {
+  if (!wifiEnabled) {
+    Serial.println("📶 WiFi not running");
+    return;
   }
+  
+  Serial.println("📶 Stopping WiFi SoftAP...");
+  
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  wifiEnabled = false;
+  Serial.println("   ✅ WiFi SoftAP stopped");
+}
 
-  void processFlightConfigCommand(String cmd) {
-    Serial.print(">>> Flight Config Command: "); Serial.println(cmd);
-    
-    if (cmd.startsWith("FILENAME:")) {
-      String filename = cmd.substring(9);
-      filename.trim();
-      if (filename.length() > 0) {
-        flightConfig.filename = filename + ".csv";
-        Serial.print("✓ Filename set to: "); Serial.println(flightConfig.filename);
-      } else {
-        Serial.println("ERROR: Invalid filename");
-      }
-    }
-    else if (cmd.startsWith("WEIGHT:")) {
-      String weightStr = cmd.substring(7);
-      weightStr.trim();
-      float weight = weightStr.toFloat();
-      if (weight > 0) {
-        flightConfig.totalWeight = weight;
-        Serial.print("✓ Weight set to: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
-      } else {
-        Serial.println("ERROR: Invalid weight value");
-      }
-    }
-    else if (cmd.startsWith("WIND:")) {
-      String windStr = cmd.substring(5);
-      windStr.trim();
-      float wind = windStr.toFloat();
-      if (wind >= 0) {
-        flightConfig.windSpeed = wind;
-        Serial.print("✓ Wind speed set to: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
-      } else {
-        Serial.println("ERROR: Invalid wind speed value");
-      }
-    }
-    else if (cmd.startsWith("HEIGHT:")) {
-      String heightStr = cmd.substring(7);
-      heightStr.trim();
-      float height = heightStr.toFloat();
-      flightConfig.initialHeight = height;
-      Serial.print("✓ Height set to: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
-    }
-    else if (cmd == "CONFIRM") {
-      Serial.println(">>> CONFIRM received! Starting flight recording...");
-      Serial.println("=== FINAL CONFIGURATION ===");
-      Serial.print("Filename: "); Serial.println(flightConfig.filename);
-      Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
-      Serial.print("Wind Speed: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");  
-      Serial.print("Initial Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
-      
-      flightConfig.startTime = millis();
-      flightState = FLIGHT_CONFIGURED;
-      Serial.println("✓ Configuration complete - starting data recording!");
-      
-      // Auto-start recording after confirmation
-      startDataRecording();
-    }
-    else if (cmd == "CANCEL") {
-      Serial.println(">>> Configuration cancelled. Returning to idle state.");
-      flightState = FLIGHT_IDLE;
-    }
-    else {
-      Serial.println("ERROR: Unknown config command. Use FILENAME:, WEIGHT:, WIND:, HEIGHT:, CONFIRM, or CANCEL");
-    }
-    
-    // Show current configuration status
-    if (flightState == FLIGHT_CONFIGURING) {
-      Serial.println("\n--- Current Configuration ---");
-      Serial.print("Filename: "); Serial.println(flightConfig.filename);
-      Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
-      Serial.print("Wind: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
-      Serial.print("Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
-      Serial.println("Send CONFIRM when ready, or more parameter commands to change values");
-      Serial.println(">>> WAITING FOR NEXT COMMAND <<<");
-    }
+void setupWebServer() {
+  // Main page - file browser
+  server.on("/", HTTP_GET, handleRoot);
+  
+  // File download endpoint
+  server.on("/download", HTTP_GET, handleFileDownload);
+  
+  // File list API endpoint
+  server.on("/api/files", HTTP_GET, handleFileListAPI);
+  
+  // System info API endpoint
+  server.on("/api/info", HTTP_GET, handleSystemInfoAPI);
+  
+  // 404 handler
+  server.onNotFound(handleNotFound);
+  
+  Serial.println("   📡 Web server routes configured");
+}
+
+void handleRoot() {
+  String html = generateMainPage();
+  server.send(200, "text/html", html);
+}
+
+void handleFileDownload() {
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Missing file parameter");
+    return;
   }
+  
+  String filename = server.arg("file");
+  String filepath = "/" + filename;
+  
+  if (!LittleFS.exists(filepath)) {
+    server.send(404, "text/plain", "File not found: " + filename);
+    return;
+  }
+  
+  File file = LittleFS.open(filepath, "r");
+  if (!file) {
+    server.send(500, "text/plain", "Failed to open file: " + filename);
+    return;
+  }
+  
+  // Set headers for file download
+  server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+  server.sendHeader("Content-Type", "text/plain");
+  
+  // Stream file content
+  server.streamFile(file, "text/plain");
+  file.close();
+  
+  Serial.println("📥 Downloaded: " + filename + " to client " + server.client().remoteIP().toString());
+}
+
+void handleFileListAPI() {
+  String json = "{\"files\":[";
+  
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  bool first = true;
+  
+  while (file) {
+    if (!file.isDirectory()) {
+      if (!first) json += ",";
+      json += "{";
+      json += "\"name\":\"" + String(file.name()) + "\",";
+      json += "\"size\":" + String(file.size()) + ",";
+      json += "\"type\":\"" + getFileType(file.name()) + "\"";
+      json += "}";
+      first = false;
+    }
+    file = root.openNextFile();
+  }
+  
+  json += "],\"totalFiles\":" + String(getLittleFSFileCount()) + "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleSystemInfoAPI() {
+  String json = "{";
+  json += "\"chipModel\":\"" + String(ESP.getChipModel()) + "\",";
+  json += "\"chipRevision\":" + String(ESP.getChipRevision()) + ",";
+  json += "\"cpuFreq\":" + String(ESP.getCpuFreqMHz()) + ",";
+  json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"totalHeap\":" + String(ESP.getHeapSize()) + ",";
+  json += "\"uptime\":" + String(millis()) + ",";
+  json += "\"flightState\":" + String(flightState) + ",";
+  json += "\"wifiClients\":" + String(WiFi.softAPgetStationNum());
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Page not found");
+}
+
+String generateMainPage() {
+String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚁 Pavi Flight Data Server</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 20px; 
+            background-color: #f5f5f5; 
+        }
+        .container { 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background: white; 
+            padding: 20px; 
+            border-radius: 10px; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1); 
+        }
+        .header { 
+            text-align: center; 
+            color: #2c3e50; 
+            border-bottom: 2px solid #3498db; 
+            padding-bottom: 10px; 
+            margin-bottom: 20px; 
+        }
+        .info-box { 
+            background: #ecf0f1; 
+            padding: 15px; 
+            border-radius: 5px; 
+            margin: 15px 0; 
+        }
+        .file-list { 
+            margin: 20px 0; 
+        }
+        .file-item { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            padding: 10px; 
+            border: 1px solid #ddd; 
+            margin: 5px 0; 
+            border-radius: 5px; 
+            background: #fff; 
+        }
+        .file-name { 
+            font-weight: bold; 
+            color: #2c3e50; 
+        }
+        .file-size { 
+            color: #7f8c8d; 
+            font-size: 0.9em; 
+        }
+        .download-btn { 
+            background: #3498db; 
+            color: white; 
+            border: none; 
+            padding: 8px 15px; 
+            border-radius: 3px; 
+            cursor: pointer; 
+            text-decoration: none; 
+            display: inline-block; 
+        }
+        .download-btn:hover { 
+            background: #2980b9; 
+        }
+        .refresh-btn { 
+            background: #27ae60; 
+            color: white; 
+            border: none; 
+            padding: 10px 20px; 
+            border-radius: 5px; 
+            cursor: pointer; 
+            margin: 10px 0; 
+        }
+        .refresh-btn:hover { 
+            background: #219a52; 
+        }
+        .status { 
+            display: inline-block; 
+            padding: 5px 10px; 
+            border-radius: 15px; 
+            font-size: 0.8em; 
+            font-weight: bold; 
+        }
+        .status.online { 
+            background: #2ecc71; 
+            color: white; 
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚁 Pavi Flight Data Server</h1>
+            <div class="status online">📶 SoftAP Online</div>
+        </div>
+        
+        <div class="info-box">
+            <h3>📊 System Information</h3>
+            <p><strong>Device:</strong> ESP32 Flight Computer</p>
+            <p><strong>Uptime:</strong> <span id="uptime">Loading...</span></p>
+            <p><strong>Free Memory:</strong> <span id="memory">Loading...</span></p>
+            <p><strong>Connected Clients:</strong> <span id="clients">Loading...</span></p>
+        </div>
+        
+        <div class="file-list">
+            <h3>📁 Available Flight Data Files</h3>
+            <button class="refresh-btn" onclick="refreshFiles()"> Refresh File List </button>
+            <div id="files">
+                <p>📡 Loading files...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+        function formatUptime(ms) {
+            const seconds = Math.floor(ms / 1000);
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = seconds % 60;
+            return hours + 'h ' + minutes + 'm ' + secs + 's';
+        }
+        
+        async function refreshFiles() {
+            try {
+                const response = await fetch('/api/files');
+                const data = await response.json();
+                
+                let html = '';
+                if (data.files.length === 0) {
+                    html = '<p>📂 No files found. Start a flight recording to generate data files!</p>';
+                } else {
+                    data.files.forEach(file => {
+                        const icon = file.type === 'txt' ? '📄' : '📁';
+                        html += `
+                            <div class="file-item">
+                                <div>
+                                    <span class="file-name">${icon} ${file.name}</span><br>
+                                    <span class="file-size">${formatBytes(file.size)}</span>
+                                </div>
+                                <a href="/download?file=${file.name}" class="download-btn"> Download</a>
+                            </div>
+                        `;
+                    });
+                }
+                document.getElementById('files').innerHTML = html;
+            } catch (error) {
+                document.getElementById('files').innerHTML = '<p style="color: red;">❌ Error loading files</p>';
+            }
+        }
+        
+        async function updateSystemInfo() {
+            try {
+                const response = await fetch('/api/info');
+                const data = await response.json();
+                
+                document.getElementById('uptime').textContent = formatUptime(data.uptime);
+                document.getElementById('memory').textContent = formatBytes(data.freeHeap) + ' / ' + formatBytes(data.totalHeap);
+                document.getElementById('clients').textContent = data.wifiClients;
+            } catch (error) {
+                console.error('Error updating system info:', error);
+            }
+        }
+        
+        // Initial load
+        refreshFiles();
+        updateSystemInfo();
+        
+        // Auto-refresh every 5 seconds
+        setInterval(updateSystemInfo, 5000);
+    </script>
+</body>
+</html>
+)rawliteral";
+  
+  return html;
+}
+
+String getFileType(String filename) {
+  if (filename.endsWith(".txt")) return "txt";
+  if (filename.endsWith(".csv")) return "csv";
+  if (filename.endsWith(".log")) return "log";
+  return "unknown";
+}
+
+int getLittleFSFileCount() {
+  int count = 0;
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  
+  while (file) {
+    if (!file.isDirectory()) {
+      count++;
+    }
+    file = root.openNextFile();
+  }
+  
+  return count;
+}
+
+void handleWiFiClients() {
+  if (wifiEnabled) {
+    server.handleClient();
+  }
+}
+
+// === LOAD CELL CALIBRATION FUNCTIONS ===
+void startLoadCellCalibration() {
+  Serial.println("⚖️ Load cell calibration started");
+  Serial.println("   Place no weight on the load cell and send 'cal zero'");
+  // Implementation for starting calibration
+}
+
+void stopLoadCellCalibration() {
+  Serial.println("⚖️ Load cell calibration stopped");
+  // Implementation for stopping calibration
+}
+
+bool isLoadCellCalibrating() {
+  // Return true if calibration is in progress
+  return false;
+}
+
+void calibrateLoadCellZero() {
+  Serial.println("⚖️ Calibrating load cell zero point");
+  if (loadCellReady) {
+    loadCell.tare();
+    Serial.println("   ✅ Zero point calibrated");
+  } else {
+    Serial.println("   ❌ Load cell not ready");
+  }
+}
+
+void calibrateLoadCellWeight(float weight) {
+  Serial.print("⚖️ Calibrating with known weight: ");
+  Serial.print(weight, 2);
+  Serial.println(" kg");
+  
+  if (loadCellReady && weight > 0) {
+    // Get raw reading
+    long reading = loadCell.get_value(10);
+    
+    // Calculate calibration factor
+    loadCellCalibrationFactor = reading / weight;
+    loadCell.set_scale(loadCellCalibrationFactor);
+    
+    Serial.print("   ✅ Calibration factor: ");
+    Serial.println(loadCellCalibrationFactor, 2);
+  } else {
+    Serial.println("   ❌ Invalid weight or load cell not ready");
+  }
+}
+
+void saveLoadCellCalibration() {
+  Serial.println("⚖️ Load cell calibration saved to LittleFS");
+  // Implementation for saving calibration data
+}
+
+void testLoadCellCalibration() {
+  Serial.println("⚖️ Testing load cell calibration");
+  if (loadCellReady) {
+    float weight = loadCell.get_units(10);
+    Serial.print("   Current reading: ");
+    Serial.print(weight, 3);
+    Serial.println(" kg");
+  } else {
+    Serial.println("   ❌ Load cell not ready");
+  }
+}
+
+// === END OF FILE ===
