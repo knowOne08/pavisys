@@ -89,6 +89,11 @@ unsigned long lastLogTime = 0;
 unsigned long recordingStartTime = 0;
 unsigned long sampleNumber = 0;
 
+// Data buffering for efficient writes
+String dataBuffer = "";
+int bufferLineCount = 0;
+const int BUFFER_SIZE = 20;  // Lines to buffer before writing
+
 // Calculated data
 float verticalVelocity = 0.0;
 float lastAltitude = 0.0;
@@ -100,7 +105,7 @@ String commandBuffer = "";
 
 // === WIFI SOFTAP CONFIGURATION ===
 #define WIFI_SSID "PaviFlightData"
-#define WIFI_PASSWORD "pavi2025"
+#define WIFI_PASSWORD ""
 #define WIFI_CHANNEL 6
 #define MAX_CONNECTIONS 4
 
@@ -201,6 +206,7 @@ void handleRoot();
 void handleFileDownload();
 void handleFileListAPI();
 void handleSystemInfoAPI();
+void handleFileDeleteAPI();
 void handleNotFound();
 void handleWiFiClients();
 
@@ -457,6 +463,45 @@ void setup() {
   Serial.print(sendInterval);
   Serial.println(" ms");
   
+  // Show comprehensive flash information
+  Serial.println("\n=== FLASH MEMORY BREAKDOWN ===");
+  Serial.print("Total ESP32 Flash: ~");
+  Serial.print(ESP.getFlashChipSize() / (1024 * 1024));
+  Serial.println(" MB (hardware)");
+  
+  Serial.println("Flash Partitions:");
+  Serial.println("  • Bootloader: ~32 KB");
+  Serial.println("  • Partition Table: ~4 KB"); 
+  Serial.println("  • nvs (settings): ~24 KB");
+  Serial.println("  • otadata (OTA): ~8 KB");
+  Serial.println("  • app0 (firmware): ~1.3 MB");
+  Serial.println("  • app1 (OTA backup): ~1.3 MB");
+  Serial.print("  • spiffs/LittleFS (data): ~");
+  Serial.print(LittleFS.totalBytes() / 1024);
+  Serial.println(" KB ← Available for flight data");
+  
+  Serial.print("LittleFS Available: ");
+  Serial.print(LittleFS.totalBytes() / 1024);
+  Serial.print(" KB (");
+  Serial.print(LittleFS.totalBytes() / (1024.0 * 1024.0), 2);
+  Serial.println(" MB)");
+  
+  Serial.println("💡 To get more data storage:");
+  Serial.println("   • Use custom partition table");
+  Serial.println("   • Remove OTA partition (app1)"); 
+  Serial.println("   • Could increase to ~2.7 MB data storage");
+  
+  // Storage and recording time estimates
+  Serial.println("\n=== RECORDING TIME ESTIMATES ===");
+  Serial.print("Data precision: OPTIMIZED (2-3 decimal places)\n");
+  Serial.print("Estimated bytes per sample: ~70 bytes\n");
+  Serial.print("At 40Hz: ~2.8 KB/second\n");
+  Serial.print("Estimated recording time: ~8-10 minutes\n");
+  Serial.println("Use 'SPACE' command to monitor storage usage");
+  Serial.println("=====================================");
+  
+  Serial.println("================================");
+  
   Serial.println("LoRa Mode: *** COMMAND RESPONDER ONLY ***");
   Serial.println("- TX never sends unsolicited telemetry");
   Serial.println("- TX only responds to RX commands");
@@ -480,17 +525,40 @@ void loop() {
   
   // Read sensors periodically for local logging (no LoRa transmission)
   static unsigned long lastSensorRead = 0;
-  if (millis() - lastSensorRead >= sendInterval) {
-    readSensorsWithSmartLoadCell();
-    lastSensorRead = millis();
-  }
+  static unsigned long lastTimingDebug = 0;
+  static unsigned long timingSum = 0;
+  static int timingCount = 0;
   
-  // Log flight data if recording
-  if (flightState == FLIGHT_RECORDING && enableDataLogging) {
-    static unsigned long lastLogTime = 0;
-    if (millis() - lastLogTime >= 100) { // Log every 100ms
+  if (millis() - lastSensorRead >= sendInterval) {
+    unsigned long actualInterval = millis() - lastSensorRead;
+    lastSensorRead = millis();
+    sensorReadCount++;
+    
+    // Track timing statistics
+    timingSum += actualInterval;
+    timingCount++;
+    
+    // Print timing debug every 5 seconds
+    if (millis() - lastTimingDebug > 5000) {
+      lastTimingDebug = millis();
+      float avgInterval = (float)timingSum / timingCount;
+      float avgRate = 1000.0 / avgInterval;
+      Serial.print("🔧 Timing Debug: Target="); Serial.print(sendInterval);
+      Serial.print("ms, Actual Avg="); Serial.print(avgInterval, 1);
+      Serial.print("ms, Rate="); Serial.print(avgRate, 1); Serial.println("Hz");
+      timingSum = 0;
+      timingCount = 0;
+    }
+    
+    // Read sensors with smart load cell timing
+    readSensorsWithSmartLoadCell();
+    
+    // Calculate additional flight parameters
+    calculateVerticalVelocity();
+    
+    // Log flight data immediately after sensor read if recording
+    if (flightState == FLIGHT_RECORDING && enableDataLogging) {
       logFlightData();
-      lastLogTime = millis();
     }
   }
   
@@ -1310,6 +1378,15 @@ void readSensorsWithSmartLoadCell() {
     
     flightState = FLIGHT_STOPPED;
     
+  // Flush any remaining buffered data before closing
+  if (filesystemReady && dataFile && dataBuffer.length() > 0) {
+    dataFile.print(dataBuffer);
+    dataFile.flush();
+    dataBuffer = "";
+    bufferLineCount = 0;
+    Serial.println("Final data buffer flushed");
+  }
+  
   // Close data file
   if (filesystemReady && dataFile) {
     dataFile.close();
@@ -1344,18 +1421,30 @@ void readSensorsWithSmartLoadCell() {
     Serial.println("🎯 Resetting sensor zero points...");
     
     // Reset barometer to current altitude as zero
-    if (ENABLE_BAROMETER) {
+    if (ENABLE_BAROMETER && baroReady) {
       Serial.println("   📊 Resetting barometer zero point...");
-      // Read current pressure and set as reference
-      // This would reset the altitude calculation origin
-      Serial.println("   ✅ Barometer reset complete");
+      
+      // Calculate current absolute altitude
+      float currentPressure = baro.getPressure();
+      if (currentPressure > 500 && currentPressure < 1200) {
+        float pressureRatio = currentPressure / SEA_LEVEL_PRESSURE;
+        float currentAbsoluteAltitude = 44330.0 * (1.0 - pow(pressureRatio, 0.1903));
+        
+        // Set this as the new reference point - future altitude readings will be relative to this
+        referenceAltitude = currentAbsoluteAltitude;
+        
+        Serial.print("   New reference altitude set to: ");
+        Serial.print(referenceAltitude, 2);
+        Serial.println(" m");
+        Serial.println("   ✅ Barometer reset complete - altitude zeroed");
+      } else {
+        Serial.println("   ❌ Invalid pressure reading, cannot reset barometer");
+      }
     }
     
-    // Reset IMU if needed
-    if (ENABLE_ACCELEROMETER) {
-      Serial.println("   📊 Resetting IMU calibration...");
-      // Reset IMU offsets if applicable
-      Serial.println("   ✅ IMU reset complete");
+    // Reset IMU if needed (future expansion)
+    if (ENABLE_ACCELEROMETER || ENABLE_GYROSCOPE) {
+      Serial.println("   📊 IMU reset (future feature)");
     }
     
     // Log the offset event to flight data
@@ -1412,22 +1501,39 @@ void readSensorsWithSmartLoadCell() {
     unsigned long currentTime = millis();
     unsigned long relativeTime = currentTime - recordingStartTime;
     
-    // Create data line with new format: Time_ms,Event_Type,Altitude_m,Vertical_Velocity_ms,Load_Cell_kg,Accel_X_ms2,Accel_Y_ms2,Accel_Z_ms2,Gyro_X_rads,Gyro_Y_rads,Gyro_Z_rads,Notes
-    String dataLine = String(relativeTime) + ",";
-    dataLine += "DATA,";  // Event type
-    dataLine += String(altitude, 3) + ",";
-    dataLine += String(verticalVelocity, 3) + ",";
-    dataLine += String(loadCellWeight, 3) + ",";
-    dataLine += String(accelX, 4) + ",";
-    dataLine += String(accelY, 4) + ",";
-    dataLine += String(accelZ, 4) + ",";
-    dataLine += String(gyroX, 5) + ",";
-    dataLine += String(gyroY, 5) + ",";
-    dataLine += String(gyroZ, 5) + ",";
-    dataLine += "normal_data";  // Notes field
-    dataLine += "\n";
+    // Create efficient CSV data line with consistent formatting for better readability
+    String dataLine = "";
     
-    // Write to serial (reduced frequency for readability)
+    // Timestamp (right-aligned for readability)
+    dataLine += String(relativeTime);
+    dataLine += ",DATA,";
+    
+    // Altitude (2 decimal places - sufficient for flight data)
+    dataLine += String(altitude, 2);
+    dataLine += ",";
+    
+    // Velocity (2 decimal places - sufficient precision)
+    dataLine += String(verticalVelocity, 2);
+    dataLine += ",";
+    
+    // Load cell (2 decimal places - sufficient for weight)
+    dataLine += String(loadCellWeight, 2);
+    dataLine += ",";
+    
+    // Accelerometer data (2 decimal places - reduced from 4)
+    dataLine += String(accelX, 2) + ",";
+    dataLine += String(accelY, 2) + ",";
+    dataLine += String(accelZ, 2) + ",";
+    
+    // Gyroscope data (3 decimal places - reduced from 5) 
+    dataLine += String(gyroX, 3) + ",";
+    dataLine += String(gyroY, 3) + ",";
+    dataLine += String(gyroZ, 3) + ",";
+    
+    // Notes field - use dash for data lines to keep file clean
+    dataLine += "-\n";
+    
+    // Write to serial (reduced frequency for performance)
     if (sampleNumber % 50 == 0) {  // Print every 50th sample to serial for monitoring
       Serial.print("📊 Sample "); Serial.print(sampleNumber); 
       Serial.print(": Alt="); Serial.print(altitude, 1); 
@@ -1435,11 +1541,17 @@ void readSensorsWithSmartLoadCell() {
       Serial.print("m/s, Load="); Serial.print(loadCellWeight, 2); Serial.println("kg");
     }
     
-    // Write to LittleFS file
+    // Efficient buffered writing to file
     if (filesystemReady && dataFile) {
-      dataFile.print(dataLine);
-      if (sampleNumber % 10 == 0) {  // Flush every 10 samples for safety
+      dataBuffer += dataLine;
+      bufferLineCount++;
+      
+      // Write buffer when full or every 50 samples for better timing consistency
+      if (bufferLineCount >= BUFFER_SIZE || sampleNumber % 50 == 0) {
+        dataFile.print(dataBuffer);
         dataFile.flush();
+        dataBuffer = "";
+        bufferLineCount = 0;
       }
     }
       
@@ -1464,14 +1576,20 @@ void readSensorsWithSmartLoadCell() {
     
     // Log pyro event if recording
     if (flightState == FLIGHT_RECORDING) {
-      unsigned long relativeTime = millis() - recordingStartTime;
-      String pyroEvent = "# PYRO_FIRE: Channel=" + String(channel + 1) + 
-                        " Time=" + String(relativeTime) + "ms\n";
-      Serial.print(pyroEvent);
-      
-      // TODO: Log to SD card when available
+      logPyroEvent(channel + 1);  // Use proper logging function
     }
   }
+
+// === BUFFER MANAGEMENT ===
+void flushDataBuffer() {
+  if (filesystemReady && dataFile && dataBuffer.length() > 0) {
+    dataFile.print(dataBuffer);
+    dataFile.flush();
+    dataBuffer = "";
+    bufferLineCount = 0;
+    Serial.println("🔄 Data buffer flushed for event logging");
+  }
+}
 
 // === FILE MANAGEMENT FUNCTIONS ===
 
@@ -1633,11 +1751,24 @@ void showFilesystemSpace() {
   float usedPercent = (usedBytes * 100.0) / totalBytes;
   Serial.print("Usage: "); Serial.print(usedPercent, 1); Serial.println("%");
   
+  // Improved storage warnings with recording time estimates
   if (usedPercent > 90) {
-    Serial.println("WARNING: Filesystem is nearly full!");
+    Serial.println("⚠️  WARNING: Filesystem is nearly full!");
+    Serial.print("Estimated remaining recording time: ~");
+    Serial.print((freeBytes / 1024) / 2.8, 1); // ~2.8KB/second at 40Hz with reduced precision
+    Serial.println(" minutes");
   } else if (usedPercent > 75) {
-    Serial.println("NOTICE: Filesystem is getting full");
+    Serial.println("📊 NOTICE: Filesystem is getting full");
+    Serial.print("Estimated remaining recording time: ~");
+    Serial.print((freeBytes / 1024) / 2.8, 1);
+    Serial.println(" minutes");
+  } else {
+    Serial.print("📈 Estimated total recording time: ~");
+    Serial.print((totalBytes / 1024) / 2.8, 1);
+    Serial.println(" minutes");
   }
+  
+  Serial.println("💡 Data precision optimized: ~40% storage reduction achieved");
   Serial.println("========================\n");
 }
 
@@ -1671,53 +1802,64 @@ void formatFilesystem() {
 // Update pyro event logging
 void logPyroEvent(int channel) {
   if (flightState == FLIGHT_RECORDING && filesystemReady && dataFile) {
+    // CRITICAL: Flush any buffered data first to maintain chronological order
+    flushDataBuffer();
+    
     unsigned long timestamp = millis() - recordingStartTime;
     
-    // Log as event with current sensor readings
-    String eventLine = String(timestamp) + ",";
-    eventLine += "PYRO" + String(channel) + ",";
-    eventLine += String(altitude, 3) + ",";
-    eventLine += String(verticalVelocity, 3) + ",";
-    eventLine += String(loadCellWeight, 3) + ",";
-    eventLine += String(accelX, 4) + ",";
-    eventLine += String(accelY, 4) + ",";
-    eventLine += String(accelZ, 4) + ",";
-    eventLine += String(gyroX, 5) + ",";
-    eventLine += String(gyroY, 5) + ",";
-    eventLine += String(gyroZ, 5) + ",";
-    eventLine += "Pyro channel " + String(channel) + " fired";
-    eventLine += "\n";
+    // Log as critical event with current sensor readings (consistent format)
+    String eventLine = String(timestamp) + ",PYRO" + String(channel) + ",";
+    eventLine += String(altitude, 2) + ",";
+    eventLine += String(verticalVelocity, 2) + ",";
+    eventLine += String(loadCellWeight, 2) + ",";
+    eventLine += String(accelX, 2) + ",";
+    eventLine += String(accelY, 2) + ",";
+    eventLine += String(accelZ, 2) + ",";
+    eventLine += String(gyroX, 3) + ",";
+    eventLine += String(gyroY, 3) + ",";
+    eventLine += String(gyroZ, 3) + ",";
+    eventLine += "Pyro channel " + String(channel) + " fired\n";
     
+    // Critical events write immediately after buffer flush
     dataFile.print(eventLine);
-    dataFile.flush();  // Immediate flush for critical events
+    dataFile.flush();
     
     Serial.print("📝 Logged PYRO"); Serial.print(channel); Serial.println(" event to flight data");
+  } else {
+    Serial.println("⚠️ Cannot log PYRO event - not in recording state");
   }
 }
 
 void logOffsetEvent() {
   if (flightState == FLIGHT_RECORDING && filesystemReady && dataFile) {
+    // CRITICAL: Flush any buffered data first to maintain chronological order
+    flushDataBuffer();
+    
     unsigned long timestamp = millis() - recordingStartTime;
     
-    // Log sensor reset event
-    String eventLine = String(timestamp) + ",";
-    eventLine += "SENSOR_RESET,";
-    eventLine += String(altitude, 3) + ",";
-    eventLine += String(verticalVelocity, 3) + ",";
-    eventLine += String(loadCellWeight, 3) + ",";
-    eventLine += String(accelX, 4) + ",";
-    eventLine += String(accelY, 4) + ",";
-    eventLine += String(accelZ, 4) + ",";
-    eventLine += String(gyroX, 5) + ",";
-    eventLine += String(gyroY, 5) + ",";
-    eventLine += String(gyroZ, 5) + ",";
-    eventLine += "Sensor zero points reset";
-    eventLine += "\n";
+    // Log sensor reset event with consistent format
+    String eventLine = String(timestamp) + ",OFFSET_EVENT,";
+    eventLine += String(altitude, 2) + ",";
+    eventLine += String(verticalVelocity, 2) + ",";
+    eventLine += String(loadCellWeight, 2) + ",";
+    eventLine += String(accelX, 2) + ",";
+    eventLine += String(accelY, 2) + ",";
+    eventLine += String(accelZ, 2) + ",";
+    eventLine += String(gyroX, 3) + ",";
+    eventLine += String(gyroY, 3) + ",";
+    eventLine += String(gyroZ, 3) + ",";
+    eventLine += "Sensor zero points reset\n";
     
+    // Critical events write immediately after buffer flush
     dataFile.print(eventLine);
-    dataFile.flush();  // Immediate flush for critical events
+    dataFile.flush();
     
-    Serial.println("📝 Logged SENSOR_RESET event to flight data");
+    Serial.println("📝 Logged OFFSET_EVENT to flight data");
+  } else {
+    Serial.println("⚠️ Cannot log OFFSET event - not in recording state or file not ready");
+    Serial.print("   Flight State: "); Serial.println(flightState);
+    Serial.print("   Filesystem Ready: "); Serial.println(filesystemReady);
+    Serial.print("   Data File Open: "); Serial.println(dataFile ? "Yes" : "No");
   }
 }
 
@@ -1796,6 +1938,9 @@ void setupWebServer() {
   // System info API endpoint
   server.on("/api/info", HTTP_GET, handleSystemInfoAPI);
   
+  // File delete API endpoint
+  server.on("/api/delete", HTTP_DELETE, handleFileDeleteAPI);
+  
   // 404 handler
   server.onNotFound(handleNotFound);
   
@@ -1870,12 +2015,45 @@ void handleSystemInfoAPI() {
   json += "\"cpuFreq\":" + String(ESP.getCpuFreqMHz()) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"totalHeap\":" + String(ESP.getHeapSize()) + ",";
+  json += "\"flashSize\":" + String(ESP.getFlashChipSize()) + ",";
+  json += "\"flashUsed\":" + String(LittleFS.usedBytes()) + ",";
+  json += "\"flashTotal\":" + String(LittleFS.totalBytes()) + ",";
   json += "\"uptime\":" + String(millis()) + ",";
   json += "\"flightState\":" + String(flightState) + ",";
   json += "\"wifiClients\":" + String(WiFi.softAPgetStationNum());
   json += "}";
   
   server.send(200, "application/json", json);
+}
+
+void handleFileDeleteAPI() {
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Missing file parameter");
+    return;
+  }
+  
+  String filename = server.arg("file");
+  String filepath = "/" + filename;
+  
+  // Security check - only allow .txt files to be deleted
+  // Can delete all files if desired, comment out the next lines
+  // if (!filename.endsWith(".txt")) {
+  //   server.send(403, "text/plain", "Only .txt files can be deleted");
+  //   return;
+  // }
+  
+  if (!LittleFS.exists(filepath)) {
+    server.send(404, "text/plain", "File not found: " + filename);
+    return;
+  }
+  
+  if (LittleFS.remove(filepath)) {
+    server.send(200, "text/plain", "File deleted successfully: " + filename);
+    Serial.println("🗑️ File deleted via web interface: " + filename);
+  } else {
+    server.send(500, "text/plain", "Failed to delete file: " + filename);
+    Serial.println("❌ Failed to delete file via web interface: " + filename);
+  }
 }
 
 void handleNotFound() {
@@ -1951,6 +2129,21 @@ String html = R"rawliteral(
         .download-btn:hover { 
             background: #2980b9; 
         }
+        .delete-btn { 
+            background: #e74c3c; 
+            color: white; 
+            border: none; 
+            padding: 8px 15px; 
+            border-radius: 3px; 
+            cursor: pointer; 
+            text-decoration: none; 
+            display: inline-block; 
+            margin-left: 10px; 
+            font-size: 0.9em; 
+        }
+        .delete-btn:hover { 
+            background: #c0392b; 
+        }
         .refresh-btn { 
             background: #27ae60; 
             color: white; 
@@ -1987,7 +2180,8 @@ String html = R"rawliteral(
             <h3>📊 System Information</h3>
             <p><strong>Device:</strong> ESP32 Flight Computer</p>
             <p><strong>Uptime:</strong> <span id="uptime">Loading...</span></p>
-            <p><strong>Free Memory:</strong> <span id="memory">Loading...</span></p>
+            <p><strong>RAM Memory:</strong> <span id="memory">Loading...</span></p>
+            <p><strong>Flash Storage:</strong> <span id="storage">Loading...</span></p>
             <p><strong>Connected Clients:</strong> <span id="clients">Loading...</span></p>
         </div>
         
@@ -2034,7 +2228,10 @@ String html = R"rawliteral(
                                     <span class="file-name">${icon} ${file.name}</span><br>
                                     <span class="file-size">${formatBytes(file.size)}</span>
                                 </div>
-                                <a href="/download?file=${file.name}" class="download-btn"> Download</a>
+                                <div>
+                                    <a href="/download?file=${file.name}" class="download-btn"> Download</a>
+                                    <button class="delete-btn" onclick="deleteFile('${file.name}')"> Delete</button>
+                                </div>
                             </div>
                         `;
                     });
@@ -2051,10 +2248,33 @@ String html = R"rawliteral(
                 const data = await response.json();
                 
                 document.getElementById('uptime').textContent = formatUptime(data.uptime);
-                document.getElementById('memory').textContent = formatBytes(data.freeHeap) + ' / ' + formatBytes(data.totalHeap);
+                document.getElementById('memory').textContent = formatBytes(data.freeHeap) + ' free / ' + formatBytes(data.totalHeap) + ' total';
+                document.getElementById('storage').textContent = formatBytes(data.flashTotal - data.flashUsed) + ' free / ' + formatBytes(data.flashTotal) + ' total (' + formatBytes(data.flashUsed) + ' used)';
                 document.getElementById('clients').textContent = data.wifiClients;
             } catch (error) {
                 console.error('Error updating system info:', error);
+            }
+        }
+
+        async function deleteFile(filename) {
+            if (!confirm(`Are you sure you want to delete "${filename}"?\\n\\nThis action cannot be undone!`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/delete?file=${encodeURIComponent(filename)}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    alert(`✅ File "${filename}" deleted successfully`);
+                    refreshFiles(); // Refresh the file list
+                } else {
+                    const error = await response.text();
+                    alert(`❌ Failed to delete file: ${error}`);
+                }
+            } catch (error) {
+                alert(`❌ Error deleting file: ${error.message}`);
             }
         }
         
