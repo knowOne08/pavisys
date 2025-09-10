@@ -103,6 +103,18 @@ unsigned long lastVelocityTime = 0;
 bool waitingForCommand = false;
 String commandBuffer = "";
 
+// === MENU SYSTEM ===
+bool menuMode = false;
+int currentMenu = 0;
+int currentSubMenu = 0;
+
+// Menu constants
+#define MENU_MAIN 0
+#define MENU_FLIGHT 1
+#define MENU_FILES 2
+#define MENU_WIFI 3
+#define MENU_CALIBRATION 4
+
 // === WIFI SOFTAP CONFIGURATION ===
 #define WIFI_SSID "PaviFlightData"
 #define WIFI_PASSWORD ""
@@ -218,6 +230,26 @@ void calibrateLoadCellZero();
 void calibrateLoadCellWeight(float weight);
 void saveLoadCellCalibration();
 void testLoadCellCalibration();
+
+// Flight Data functions
+void createDataFile();
+void writeDataHeader();
+void logFlightData();
+void logOffsetEvent();
+void logPyroEvent(int channel);
+void firePyroChannel(int channel);
+
+// File Management functions
+void listFiles();
+void downloadFile(String filename);
+void deleteFile(String filename);
+void showFilesystemSpace();
+void formatFilesystem();
+
+// Web interface functions
+String generateMainPage();
+String getFileType(String filename);
+int getLittleFSFileCount();
 
 void setup() {
   Serial.begin(115200);
@@ -915,7 +947,380 @@ void readSensorsWithSmartLoadCell() {
     }
 }
   
-  // === FLIGHT DATA FUNCTIONS ===
+  // === MENU SYSTEM FUNCTIONS ===
+void showMainMenu() {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║        PAVI FLIGHT COMPUTER          ║");
+  Serial.println("║            MAIN MENU                 ║");
+  Serial.println("╠══════════════════════════════════════╣");
+  Serial.println("║  1. Flight Operations                ║");
+  Serial.println("║  2. File Management                  ║");
+  Serial.println("║  3. WiFi Controls                    ║");
+  Serial.println("║  4. Calibration & Testing            ║");
+  Serial.println("║  5. System Status                    ║");
+  Serial.println("║  6. Toggle Serial Data Output        ║");
+  Serial.println("║  0. Exit Menu                        ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.print("📋 Select option (0-6): ");
+}
+
+void showFlightMenu() {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║          FLIGHT OPERATIONS           ║");
+  Serial.println("╠══════════════════════════════════════╣");
+  Serial.println("║  1. Configure Flight Parameters      ║");
+  Serial.println("║  2. Start Recording                  ║");
+  Serial.println("║  3. Stop Recording                   ║");
+  Serial.println("║  4. Reset Sensor Origins (OFFSET)   ║");
+  Serial.println("║  5. Fire Pyro Channel 1             ║");
+  Serial.println("║  6. Fire Pyro Channel 2             ║");
+  Serial.println("║  7. Fire Pyro Channel 3             ║");
+  Serial.println("║  8. Fire Pyro Channel 4             ║");
+  Serial.println("║  9. Back to Main Menu                ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.print("🚀 Select flight option (1-9): ");
+}
+
+void showFileMenu() {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║          FILE MANAGEMENT             ║");
+  Serial.println("╠══════════════════════════════════════╣");
+  Serial.println("║  1. List All Files                  ║");
+  Serial.println("║  2. Show Storage Space               ║");
+  Serial.println("║  3. Download File                    ║");
+  Serial.println("║  4. Delete File                      ║");
+  Serial.println("║  5. Format Filesystem (WARNING!)     ║");
+  Serial.println("║  9. Back to Main Menu                ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.print("📁 Select file option (1-5, 9): ");
+}
+
+void showWiFiMenu() {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║            WIFI CONTROLS             ║");
+  Serial.println("╠══════════════════════════════════════╣");
+  if (wifiEnabled) {
+    Serial.println("║  Status: 📶 WiFi SoftAP ACTIVE       ║");
+    Serial.println("║  1. Stop WiFi SoftAP                 ║");
+  } else {
+    Serial.println("║  Status: 📵 WiFi SoftAP INACTIVE     ║");
+    Serial.println("║  1. Start WiFi SoftAP                ║");
+  }
+  Serial.println("║  2. Show WiFi Information            ║");
+  Serial.println("║  9. Back to Main Menu                ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.print("📶 Select WiFi option (1-2, 9): ");
+}
+
+void showCalibrationMenu() {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║       CALIBRATION & TESTING          ║");
+  Serial.println("╠══════════════════════════════════════╣");
+  Serial.println("║  1. Test Load Cell Reading           ║");
+  Serial.println("║  2. Zero Load Cell (Tare)           ║");
+  Serial.println("║  3. Test All Pyro Channels          ║");
+  Serial.println("║  4. Test LoRa Communication         ║");
+  Serial.println("║  5. Run Sensor Diagnostics          ║");
+  Serial.println("║  9. Back to Main Menu                ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.print("⚖️ Select calibration option (1-5, 9): ");
+}
+
+void processMenuInput(String input) {
+  input.trim();
+  int choice = input.toInt();
+  
+  if (currentMenu == MENU_MAIN) {
+    switch (choice) {
+      case 1:
+        currentMenu = MENU_FLIGHT;
+        showFlightMenu();
+        return;
+      case 2:
+        currentMenu = MENU_FILES;
+        showFileMenu();
+        return;
+      case 3:
+        currentMenu = MENU_WIFI;
+        showWiFiMenu();
+        return;
+      case 4:
+        currentMenu = MENU_CALIBRATION;
+        showCalibrationMenu();
+        return;
+      case 5:
+        Serial.println("\n🔍 Displaying system status...");
+        printSystemStatus();
+        showMainMenu();
+        return;
+      case 6:
+        showSerialData = !showSerialData;
+        Serial.print("📊 Serial data output ");
+        Serial.println(showSerialData ? "ENABLED" : "DISABLED");
+        showMainMenu();
+        return;
+      case 0:
+        Serial.println("👋 Exiting menu mode...");
+        Serial.println("💡 Type 'MENU' to return to menu system");
+        menuMode = false;
+        return;
+      default:
+        Serial.println("❌ Invalid option! Please select 0-6");
+        showMainMenu();
+        return;
+    }
+  }
+  
+  // Flight Operations Menu
+  if (currentMenu == MENU_FLIGHT) {
+    switch (choice) {
+      case 1:
+        Serial.println("🔧 Starting flight configuration...");
+        configureFlightParameters();
+        break;
+      case 2:
+        Serial.println("🚀 Starting data recording...");
+        startDataRecording();
+        break;
+      case 3:
+        Serial.println("⏹️ Stopping data recording...");
+        stopDataRecording();
+        break;
+      case 4:
+        Serial.println("🎯 Resetting sensor origins...");
+        resetSensorOrigins();
+        break;
+      case 5:
+        Serial.println("💥 Firing Pyro Channel 1...");
+        firePyroChannel(0);
+        break;
+      case 6:
+        Serial.println("💥 Firing Pyro Channel 2...");
+        firePyroChannel(1);
+        break;
+      case 7:
+        Serial.println("💥 Firing Pyro Channel 3...");
+        firePyroChannel(2);
+        break;
+      case 8:
+        Serial.println("💥 Firing Pyro Channel 4...");
+        firePyroChannel(3);
+        break;
+      case 9:
+        currentMenu = MENU_MAIN;
+        showMainMenu();
+        return;
+      default:
+        Serial.println("❌ Invalid option! Please select 1-9");
+        break;
+    }
+    delay(2000);  // Give time to read the result
+    showFlightMenu();
+  }
+  
+  // File Management Menu
+  else if (currentMenu == MENU_FILES) {
+    switch (choice) {
+      case 1:
+        Serial.println("📁 Listing all files...");
+        listFiles();
+        break;
+      case 2:
+        Serial.println("💾 Checking storage space...");
+        showFilesystemSpace();
+        break;
+      case 3:
+        Serial.print("📥 Enter filename to download: ");
+        // This will be handled by the next input
+        currentSubMenu = 3;
+        return;
+      case 4:
+        Serial.print("🗑️ Enter filename to delete: ");
+        currentSubMenu = 4;
+        return;
+      case 5:
+        Serial.println("⚠️ Starting filesystem format...");
+        formatFilesystem();
+        break;
+      case 9:
+        currentMenu = MENU_MAIN;
+        showMainMenu();
+        return;
+      default:
+        Serial.println("❌ Invalid option! Please select 1-5 or 9");
+        break;
+    }
+    if (choice != 3 && choice != 4) {  // Don't show menu if waiting for filename
+      delay(2000);
+      showFileMenu();
+    }
+  }
+  
+  // WiFi Menu
+  else if (currentMenu == MENU_WIFI) {
+    switch (choice) {
+      case 1:
+        if (wifiEnabled) {
+          Serial.println("📵 Stopping WiFi SoftAP...");
+          stopWiFiSoftAP();
+        } else {
+          Serial.println("📶 Starting WiFi SoftAP...");
+          startWiFiSoftAP();
+        }
+        break;
+      case 2:
+        Serial.println("📊 WiFi Information:");
+        if (wifiEnabled) {
+          Serial.println("   Status: ACTIVE");
+          Serial.print("   IP: "); Serial.println(WiFi.softAPIP());
+          Serial.print("   Clients: "); Serial.println(WiFi.softAPgetStationNum());
+        } else {
+          Serial.println("   Status: INACTIVE");
+        }
+        break;
+      case 9:
+        currentMenu = MENU_MAIN;
+        showMainMenu();
+        return;
+      default:
+        Serial.println("❌ Invalid option! Please select 1-2 or 9");
+        break;
+    }
+    delay(2000);
+    showWiFiMenu();
+  }
+  
+  // Calibration Menu
+  else if (currentMenu == MENU_CALIBRATION) {
+    switch (choice) {
+      case 1:
+        Serial.println("⚖️ Testing load cell...");
+        testLoadCellCalibration();
+        break;
+      case 2:
+        Serial.println("🎯 Zeroing load cell...");
+        calibrateLoadCellZero();
+        break;
+      case 3:
+        Serial.println("💡 Testing pyro channels...");
+        if (PYRO_TEST_MODE) {
+          runPyroTest();
+        } else {
+          Serial.println("⚠️ Pyro test mode is disabled. Set PYRO_TEST_MODE to true to enable.");
+        }
+        break;
+      case 4:
+        Serial.println("📡 Testing LoRa communication...");
+        Serial.println("Send 'PING' command from RX to test...");
+        break;
+      case 5:
+        Serial.println("🔍 Running sensor diagnostics...");
+        runSensorDiagnostics();
+        break;
+      case 9:
+        currentMenu = MENU_MAIN;
+        showMainMenu();
+        return;
+      default:
+        Serial.println("❌ Invalid option! Please select 1-5 or 9");
+        break;
+    }
+    delay(2000);
+    showCalibrationMenu();
+  }
+}
+
+void sendLoRaMenu() {
+  if (SERIAL_TEST_MODE) {
+    Serial.println("LoRa menu not available in test mode");
+    return;
+  }
+  
+  Serial.println("📡 Sending LoRa remote menu to ground station...");
+  
+  String menu = "MENU:\n";
+  menu += "1-CONFIG,2-START,3-STOP,4-OFFSET\n";
+  menu += "5-PYRO1,6-PYRO2,7-PYRO3,8-PYRO4\n";
+  menu += "9-STATUS,0-WIFI\n";
+  menu += "Send number+ENTER";
+  
+  LoRa.beginPacket();
+  LoRa.print(menu);
+  LoRa.endPacket();
+  
+  // Return to receive mode
+  LoRa.receive();
+  
+  Serial.println("✅ LoRa menu sent to ground station");
+}
+
+void runSensorDiagnostics() {
+  Serial.println("\n=== SENSOR DIAGNOSTICS ===");
+  Serial.print("Barometer MS5611: "); Serial.println(baroReady ? "✅ OK" : "❌ FAIL");
+  Serial.print("IMU MPU6050: "); Serial.println(mpuReady ? "✅ OK" : "❌ FAIL");
+  Serial.print("Load Cell HX711: "); Serial.println(loadCellReady ? "✅ OK" : "❌ FAIL");
+  Serial.print("Filesystem: "); Serial.println(filesystemReady ? "✅ OK" : "❌ FAIL");
+  
+  if (baroReady) {
+    Serial.print("Current pressure: "); Serial.print(pressure, 2); Serial.println(" hPa");
+    Serial.print("Current altitude: "); Serial.print(altitude, 2); Serial.println(" m");
+  }
+  
+  if (loadCellReady && loadCell.is_ready()) {
+    Serial.print("Load cell reading: "); Serial.print(loadCellWeight, 3); Serial.println(" kg");
+  }
+  
+  Serial.println("========================");
+}
+
+// === FLIGHT DATA FUNCTIONS ===
+void createDataFile() {
+    if (!filesystemReady) {
+      Serial.println("WARNING: LittleFS not ready, file creation skipped");
+      return;
+    }
+    
+    if (flightConfig.filename.isEmpty()) {
+      Serial.println("ERROR: Cannot create file - no filename configured");
+      return;
+    }
+    
+    // Close any existing file first
+    if (dataFile) {
+      dataFile.close();
+      Serial.println("Closed previous data file");
+    }
+    
+    // Create the data file
+    String filepath = "/" + flightConfig.filename;
+    dataFile = LittleFS.open(filepath, "w");
+    if (dataFile) {
+      Serial.print("📁 Created data file: "); Serial.println(filepath);
+      
+      // Write the header immediately
+      writeDataHeader();
+      
+      Serial.println("✅ Data file ready for events and recording");
+    } else {
+      Serial.println("❌ ERROR: Failed to create data file");
+      filesystemReady = false;  // Fall back to serial logging
+    }
+  }
+
+  void closeDataFile() {
+    if (filesystemReady && dataFile) {
+      // Flush any remaining buffered data before closing
+      if (dataBuffer.length() > 0) {
+        dataFile.print(dataBuffer);
+        dataBuffer = "";
+        bufferLineCount = 0;
+        Serial.println("Final data buffer flushed before close");
+      }
+      
+      dataFile.close();
+      Serial.print("📁 Data file closed: /"); Serial.println(flightConfig.filename);
+    }
+  }
 
   void calculateVerticalVelocity() {
     unsigned long currentTime = millis();
@@ -983,7 +1388,10 @@ void readSensorsWithSmartLoadCell() {
     Serial.println("STOP - Stop data recording");
     Serial.println("PYRO1, PYRO2, PYRO3, PYRO4 - Fire pyro channels");
     Serial.println("");
-    Serial.println("Local Serial Commands:");
+    Serial.println("💡 EASY ACCESS - Interactive Menu System:");
+    Serial.println("MENU or M - Open interactive menu system");
+    Serial.println("");
+    Serial.println("Legacy Serial Commands (still available):");
     Serial.println("CONFIG - Configure flight parameters");
     Serial.println("SERIALTOGGLE - Toggle serial data output");
     Serial.println("FILES - List all stored files");
@@ -1000,13 +1408,42 @@ void readSensorsWithSmartLoadCell() {
       char c = Serial.read();
       if (c == '\n' || c == '\r') {
         if (commandBuffer.length() > 0) {
-          // Check for serial toggle command
-          if (commandBuffer.equalsIgnoreCase("SERIALTOGGLE")) {
-            showSerialData = !showSerialData;
-            Serial.print("Serial data output ");
-            Serial.println(showSerialData ? "ENABLED" : "DISABLED");
-          } else {
-            processCommand(commandBuffer);
+          
+          // Handle menu system
+          if (menuMode) {
+            // Handle file operations that need filename input
+            if (currentMenu == MENU_FILES && (currentSubMenu == 3 || currentSubMenu == 4)) {
+              if (currentSubMenu == 3) {
+                Serial.println("📥 Downloading file: " + commandBuffer);
+                downloadFile(commandBuffer);
+              } else if (currentSubMenu == 4) {
+                Serial.println("🗑️ Deleting file: " + commandBuffer);
+                deleteFile(commandBuffer);
+              }
+              currentSubMenu = 0;
+              delay(2000);
+              showFileMenu();
+            } else {
+              processMenuInput(commandBuffer);
+            }
+          }
+          // Check for menu activation
+          else if (commandBuffer.equalsIgnoreCase("MENU") || commandBuffer.equalsIgnoreCase("M")) {
+            Serial.println("\n🎛️ Entering interactive menu system...");
+            menuMode = true;
+            currentMenu = MENU_MAIN;
+            showMainMenu();
+          }
+          // Legacy command support
+          else {
+            // Check for serial toggle command
+            if (commandBuffer.equalsIgnoreCase("SERIALTOGGLE")) {
+              showSerialData = !showSerialData;
+              Serial.print("Serial data output ");
+              Serial.println(showSerialData ? "ENABLED" : "DISABLED");
+            } else {
+              processCommand(commandBuffer);
+            }
           }
           commandBuffer = "";
         }
@@ -1065,6 +1502,13 @@ void readSensorsWithSmartLoadCell() {
       default: Serial.println("UNKNOWN"); break;
     }
     
+    // === LORA MENU SYSTEM ===
+    if (cmd == "MENU" || cmd == "M") {
+      Serial.println("📡 LoRa Menu System activated from ground station");
+      sendLoRaMenu();
+      return;
+    }
+    
     // === NEW INTUITIVE COMMAND PROTOCOL ===
     
     // Configuration Commands
@@ -1079,20 +1523,40 @@ void readSensorsWithSmartLoadCell() {
       Serial.println("✅ Ready for configuration parameters");
     }
     else if (cmd == "CONFIG_READY") {
-      // Be more flexible - accept CONFIG_READY if we have valid configuration
-      bool hasValidConfig = !flightConfig.filename.isEmpty() && flightConfig.totalWeight > 0;
+      // Enhanced validation with detailed status
+      bool hasFilename = !flightConfig.filename.isEmpty();
+      bool hasWeight = flightConfig.totalWeight > 0;
+      bool hasWind = flightConfig.windSpeed >= 0;
+      bool hasHeight = flightConfig.initialHeight > 0;
+      bool hasValidConfig = hasFilename && hasWeight && hasWind && hasHeight;
+      
+      Serial.println("📋 === CONFIG_READY RECEIVED ===");
+      Serial.println("Configuration status check:");
+      Serial.println("  • Filename: " + (hasFilename ? "✅ '" + flightConfig.filename + "'" : "❌ MISSING"));
+      Serial.println("  • Weight: " + (hasWeight ? "✅ " + String(flightConfig.totalWeight, 2) + " kg" : "❌ MISSING"));
+      Serial.println("  • Wind: " + (hasWind ? "✅ " + String(flightConfig.windSpeed, 2) + " m/s" : "❌ MISSING"));
+      Serial.println("  • Height: " + (hasHeight ? "✅ " + String(flightConfig.initialHeight, 2) + " m" : "❌ MISSING"));
       
       if (flightState == FLIGHT_CONFIGURING || (hasValidConfig && flightState != FLIGHT_RECORDING)) {
-        Serial.println("🚀 Configuration complete! Ready for flight operations.");
-        flightState = FLIGHT_CONFIGURED;
-        
-        // Show final config
-        Serial.println("=== FLIGHT CONFIGURATION ===");
-        Serial.print("Filename: "); Serial.println(flightConfig.filename);
-        Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
-        Serial.print("Wind Speed: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
-        Serial.print("Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
-        Serial.println("==============================");
+        if (hasValidConfig) {
+          Serial.println("🚀 Configuration complete! Ready for flight operations.");
+          flightState = FLIGHT_CONFIGURED;
+          
+          // Show final config
+          Serial.println("=== FLIGHT CONFIGURATION ACCEPTED ===");
+          Serial.print("Filename: "); Serial.println(flightConfig.filename);
+          Serial.print("Weight: "); Serial.print(flightConfig.totalWeight); Serial.println(" kg");
+          Serial.print("Wind Speed: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");
+          Serial.print("Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
+          Serial.println("=========================================");
+          
+          // NEW: Create the data file immediately after configuration
+          Serial.println("📁 Creating data file for upcoming flight...");
+          createDataFile();
+        } else {
+          Serial.println("❌ Configuration incomplete - missing parameters above");
+          Serial.println("💡 Some LoRa packets may have been lost. Try resending configuration.");
+        }
         
         if (flightState != FLIGHT_CONFIGURING) {
           Serial.println("ℹ️ Note: Configuration accepted even though not explicitly in config mode");
@@ -1102,9 +1566,7 @@ void readSensorsWithSmartLoadCell() {
         Serial.print(flightState);
         Serial.print(", Valid config: ");
         Serial.println(hasValidConfig ? "Yes" : "No");
-        Serial.println("📋 Current config status:");
-        Serial.print("  Filename: "); Serial.println(flightConfig.filename.isEmpty() ? "Missing" : flightConfig.filename);
-        Serial.print("  Weight: "); Serial.println(flightConfig.totalWeight);
+        Serial.println("� If parameters are missing, it's likely due to LoRa packet loss.");
       }
     }
     else if (cmd.startsWith("FILENAME:")) {
@@ -1311,6 +1773,9 @@ void readSensorsWithSmartLoadCell() {
     Serial.print("Wind Speed: "); Serial.print(flightConfig.windSpeed); Serial.println(" m/s");  
     Serial.print("Initial Height: "); Serial.print(flightConfig.initialHeight); Serial.println(" m");
     Serial.println("Ready to start recording! Send START command.");
+    
+    // Create and prepare the data file immediately
+    createDataFile();
   }
 
   String getSerialInput() {
@@ -1339,33 +1804,25 @@ void readSensorsWithSmartLoadCell() {
       return;
     }
     
-  if (!filesystemReady) {
-    Serial.println("WARNING: LittleFS not ready, logging to serial only");
-  }
-    
-    // Reset sensors to current position as origin
-    resetSensorOrigins();
-    
-  // Create/open data file
-  if (filesystemReady) {
-    String filepath = "/" + flightConfig.filename;
-    dataFile = LittleFS.open(filepath, "w");
-    if (dataFile) {
-      Serial.print("Created data file: "); Serial.println(filepath);
-    } else {
-      Serial.println("ERROR: Failed to create data file");
-      filesystemReady = false;  // Fall back to serial logging
+    if (!filesystemReady) {
+      Serial.println("WARNING: LittleFS not ready, logging to serial only");
     }
-  }
+    
+    // Check if data file is already prepared (it should be from CONFIG_READY)
+    if (filesystemReady && !dataFile) {
+      Serial.println("WARNING: Data file not prepared, creating now...");
+      createDataFile();
+    }
+    
+    // Reset sensors to current position as origin (this will now log OFFSET properly)
+    resetSensorOrigins();
     
     recordingStartTime = millis();
     sampleNumber = 0;
     flightState = FLIGHT_RECORDING;
     
-    // Write file header
-    writeDataHeader();
-    
     Serial.println("=== DATA RECORDING STARTED ===");
+    Serial.print("📁 Using data file: /"); Serial.println(flightConfig.filename);
     Serial.println("Send STOP command to end recording");
     Serial.println("Send PYRO1-PYRO4 commands to fire pyro channels");
   }
@@ -1378,20 +1835,20 @@ void readSensorsWithSmartLoadCell() {
     
     flightState = FLIGHT_STOPPED;
     
-  // Flush any remaining buffered data before closing
-  if (filesystemReady && dataFile && dataBuffer.length() > 0) {
-    dataFile.print(dataBuffer);
-    dataFile.flush();
-    dataBuffer = "";
-    bufferLineCount = 0;
-    Serial.println("Final data buffer flushed");
-  }
-  
-  // Close data file
-  if (filesystemReady && dataFile) {
-    dataFile.close();
-    Serial.println("Data file closed successfully");
-  }
+    // Flush any remaining buffered data and close file
+    if (filesystemReady && dataFile && dataBuffer.length() > 0) {
+      dataFile.print(dataBuffer);
+      dataFile.flush();
+      dataBuffer = "";
+      bufferLineCount = 0;
+      Serial.println("Final data buffer flushed");
+    }
+    
+    // Close data file
+    if (filesystemReady && dataFile) {
+      dataFile.close();
+      Serial.println("Data file closed successfully");
+    }
     
     unsigned long recordingTime = (millis() - recordingStartTime) / 1000;
     
@@ -1520,6 +1977,7 @@ void readSensorsWithSmartLoadCell() {
     dataLine += String(loadCellWeight, 2);
     dataLine += ",";
     
+       
     // Accelerometer data (2 decimal places - reduced from 4)
     dataLine += String(accelX, 2) + ",";
     dataLine += String(accelY, 2) + ",";
@@ -1801,11 +2259,15 @@ void formatFilesystem() {
 
 // Update pyro event logging
 void logPyroEvent(int channel) {
-  if (flightState == FLIGHT_RECORDING && filesystemReady && dataFile) {
+  // Allow logging if file is prepared (CONFIGURED state) or actively recording
+  if ((flightState == FLIGHT_CONFIGURED || flightState == FLIGHT_RECORDING) && filesystemReady && dataFile) {
     // CRITICAL: Flush any buffered data first to maintain chronological order
-    flushDataBuffer();
+    if (flightState == FLIGHT_RECORDING) {
+      flushDataBuffer();
+    }
     
-    unsigned long timestamp = millis() - recordingStartTime;
+    // Calculate timestamp - use 0 if recording hasn't started yet
+    unsigned long timestamp = (flightState == FLIGHT_RECORDING) ? (millis() - recordingStartTime) : 0;
     
     // Log as critical event with current sensor readings (consistent format)
     String eventLine = String(timestamp) + ",PYRO" + String(channel) + ",";
@@ -1818,24 +2280,32 @@ void logPyroEvent(int channel) {
     eventLine += String(gyroX, 3) + ",";
     eventLine += String(gyroY, 3) + ",";
     eventLine += String(gyroZ, 3) + ",";
-    eventLine += "Pyro channel " + String(channel) + " fired\n";
+    eventLine += "Pyro channel " + String(channel) + " fired";
+    if (flightState == FLIGHT_CONFIGURED) {
+      eventLine += " (before flight start)";
+    }
+    eventLine += "\n";
     
-    // Critical events write immediately after buffer flush
+    // Critical events write immediately
     dataFile.print(eventLine);
     dataFile.flush();
     
     Serial.print("📝 Logged PYRO"); Serial.print(channel); Serial.println(" event to flight data");
   } else {
-    Serial.println("⚠️ Cannot log PYRO event - not in recording state");
+    Serial.println("⚠️ Cannot log PYRO event - file not ready or invalid state");
   }
 }
 
 void logOffsetEvent() {
-  if (flightState == FLIGHT_RECORDING && filesystemReady && dataFile) {
+  // Allow logging if file is prepared (CONFIGURED state) or actively recording
+  if ((flightState == FLIGHT_CONFIGURED || flightState == FLIGHT_RECORDING) && filesystemReady && dataFile) {
     // CRITICAL: Flush any buffered data first to maintain chronological order
-    flushDataBuffer();
+    if (flightState == FLIGHT_RECORDING) {
+      flushDataBuffer();
+    }
     
-    unsigned long timestamp = millis() - recordingStartTime;
+    // Calculate timestamp - use 0 if recording hasn't started yet
+    unsigned long timestamp = (flightState == FLIGHT_RECORDING) ? (millis() - recordingStartTime) : 0;
     
     // Log sensor reset event with consistent format
     String eventLine = String(timestamp) + ",OFFSET_EVENT,";
@@ -1848,15 +2318,19 @@ void logOffsetEvent() {
     eventLine += String(gyroX, 3) + ",";
     eventLine += String(gyroY, 3) + ",";
     eventLine += String(gyroZ, 3) + ",";
-    eventLine += "Sensor zero points reset\n";
+    eventLine += "Sensor zero points reset";
+    if (flightState == FLIGHT_CONFIGURED) {
+      eventLine += " (before flight start)";
+    }
+    eventLine += "\n";
     
-    // Critical events write immediately after buffer flush
+    // Critical events write immediately
     dataFile.print(eventLine);
     dataFile.flush();
     
     Serial.println("📝 Logged OFFSET_EVENT to flight data");
   } else {
-    Serial.println("⚠️ Cannot log OFFSET event - not in recording state or file not ready");
+    Serial.println("⚠️ Cannot log OFFSET event - file not ready or invalid state");
     Serial.print("   Flight State: "); Serial.println(flightState);
     Serial.print("   Filesystem Ready: "); Serial.println(filesystemReady);
     Serial.print("   Data File Open: "); Serial.println(dataFile ? "Yes" : "No");
@@ -2172,7 +2646,6 @@ String html = R"rawliteral(
 <body>
     <div class="container">
         <div class="header">
-            <h1>🚁 Pavi Flight Data Server</h1>
             <div class="status online">📶 SoftAP Online</div>
         </div>
         

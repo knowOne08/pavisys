@@ -17,6 +17,20 @@ unsigned long lastCommandTime = 0;
 String pendingCommand = "";         // Command to be sent immediately
 String commandBuffer = "";
 
+// === MENU SYSTEM VARIABLES ===
+bool menuMode = false;              // Whether we're in menu navigation mode
+String menuInput = "";              // Current menu input buffer
+enum MenuLevel {
+  MENU_MAIN,
+  MENU_CONFIG,
+  MENU_FLIGHT,
+  MENU_DATA,
+  MENU_CALIBRATION,
+  MENU_WIFI,
+  MENU_SET_PARAMS
+};
+MenuLevel currentMenuLevel = MENU_MAIN;
+
 // === INTUITIVE MODE-BASED COMMAND SYSTEM ===
 enum GroundStationMode {
   MODE_CONFIG,           // Default: Configure test parameters
@@ -62,9 +76,17 @@ TelemetryData telemetry;
 // === SERIAL DATA TOGGLE ===
 bool showSerialData = true; // Set to false to suppress telemetry/data output
 
+// === FUNCTION DECLARATIONS ===
+void sendLoRaCommandNow(String command);
+void sendConfigurationToTX();
+void enterMenuMode();
+void exitMenuMode();
+void processMenuInput(String input);
+bool attemptFlightModeSwitch();
+
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  // delay(2000);
   
   Serial.println("=== RX: LoRa Ground Station (Serial Only) ===");
   Serial.println("ESP32-C3 initializing...");
@@ -110,9 +132,9 @@ void setup() {
   
   Serial.println("LoRa configured: SF7, BW125, CR4/5, Pwr20dBm");
   
-  Serial.println("🚁 *** RX READY - INTUITIVE MODE-BASED SYSTEM ***");
+  Serial.println("🚁 *** RX READY - GROUND STATION WITH MENU SYSTEM ***");
   Serial.println("💡 Starting in CONFIG mode - set your test parameters");
-  Serial.println("📚 Type 'help' for intuitive commands");
+  Serial.println("📚 Type 'help' for text commands OR 'menu' for interactive menus");
   Serial.println("===============================================");
   
   // Initialize configuration with defaults
@@ -124,8 +146,10 @@ void setup() {
   
   // Show current mode and basic help
   printCurrentMode();
-  Serial.println("\n💡 Quick start: 'set filename test1', 'set weight 2.5', etc.");
-  Serial.println("Type 'help' for complete command list.");
+  Serial.println("\n💡 Quick options:");
+  Serial.println("   • Type 'menu' for easy interactive menus");
+  Serial.println("   • Type 'help' for text command list");
+  Serial.println("   • Type commands directly (e.g., 'set filename test1')");
 }
 
 void loop() {
@@ -165,7 +189,9 @@ void loop() {
 // === GROUND STATION FUNCTIONS ===
 
 void printGroundStationHelp() {
-  Serial.println("\n=== INTUITIVE LORA FLIGHT CONTROL ===");
+  Serial.println("\n=== GROUND STATION COMMAND HELP ===");
+  Serial.println("💡 TIP: Type 'menu' for easy interactive menus!");
+  Serial.println("");
   printCurrentMode();
   Serial.println("");
   
@@ -210,6 +236,7 @@ void printGroundStationHelp() {
   }
   
   Serial.println("🔧 SYSTEM COMMANDS (Available in all modes):");
+  Serial.println("  menu                   - 🎛️ Enter interactive menu system");
   Serial.println("  mode config            - Switch to CONFIG mode");
   Serial.println("  mode flight            - Switch to FLIGHT mode");  
   Serial.println("  mode data              - Switch to DATA RECOVERY mode");
@@ -218,26 +245,39 @@ void printGroundStationHelp() {
   Serial.println("  status                 - Show system status");
   Serial.println("  help                   - Show this help");
   Serial.println("======================================");
-  Serial.println("💡 TIP: Commands are intuitive - just type what you want to do!");
+  Serial.println("💡 EASY MODE: Type 'menu' for point-and-click navigation!");
+  Serial.println("💡 TEXT MODE: Commands are intuitive - just type what you want to do!");
 }
 
 void processUserCommands() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
-      if (commandBuffer.length() > 0) {
-        // Check for serial toggle command
-        if (commandBuffer.equalsIgnoreCase("SERIALTOGGLE")) {
-          showSerialData = !showSerialData;
-          Serial.print("Serial data output ");
-          Serial.println(showSerialData ? "ENABLED" : "DISABLED");
-        } else {
-          processGroundStationCommand(commandBuffer);
+      if (menuMode) {
+        if (menuInput.length() > 0) {
+          processMenuInput(menuInput);
+          menuInput = "";
         }
-        commandBuffer = "";
+      } else {
+        if (commandBuffer.length() > 0) {
+          // Check for serial toggle command
+          if (commandBuffer.equalsIgnoreCase("SERIALTOGGLE")) {
+            showSerialData = !showSerialData;
+            Serial.print("Serial data output ");
+            Serial.println(showSerialData ? "ENABLED" : "DISABLED");
+          } else {
+            processGroundStationCommand(commandBuffer);
+          }
+          commandBuffer = "";
+        }
       }
     } else {
-      commandBuffer += c;
+      if (menuMode) {
+        menuInput += c;
+        Serial.print(c); // Echo menu input
+      } else {
+        commandBuffer += c;
+      }
     }
   }
 }
@@ -252,6 +292,10 @@ void processGroundStationCommand(String cmd) {
   // === GLOBAL COMMANDS (work in any mode) ===
   if (cmd == "help") {
     printGroundStationHelp();
+    return;
+  }
+  else if (cmd == "menu") {
+    enterMenuMode();
     return;
   }
   else if (cmd == "status") {
@@ -602,20 +646,89 @@ void printCurrentMode() {
   }
 }
 
-void switchMode(GroundStationMode newMode) {
-  if (newMode == MODE_FLIGHT && !isConfigComplete()) {
-    Serial.println("❌ Cannot enter FLIGHT mode - configuration incomplete!");
-    Serial.println("Use 'show config' to see what's missing.");
-    return;
+bool attemptFlightModeSwitch() {
+  // Check if configuration is complete
+  if (!isConfigComplete()) {
+    Serial.println("\n❌ === FLIGHT MODE BLOCKED ===");
+    Serial.println("Configuration is incomplete! Missing parameters:");
+    
+    if (testConfig.filename.isEmpty()) {
+      Serial.println("  • Filename: Not set");
+    }
+    if (testConfig.totalWeight <= 0) {
+      Serial.println("  • Weight: Not set");
+    }
+    if (testConfig.windSpeed < 0) {
+      Serial.println("  • Wind Speed: Not set");
+    }
+    if (testConfig.height <= 0) {
+      Serial.println("  • Height: Not set");
+    }
+    
+    Serial.println("\n💡 Complete the configuration first:");
+    Serial.println("   1. Use 'Set Test Parameters' option");
+    Serial.println("   2. Or set missing parameters individually");
+    Serial.println("=======================================");
+    return false;
   }
   
-  currentMode = newMode;
-  Serial.print("✅ Switched to ");
-  printCurrentMode();
+  // Show configuration and ask for confirmation
+  Serial.println("\n🚀 === ENTERING FLIGHT MODE ===");
+  Serial.println("Current configuration will be used:");
+  Serial.println("╔════════════════════════════════╗");
+  Serial.println("║        FLIGHT CONFIG           ║");
+  Serial.println("╠════════════════════════════════╣");
+  Serial.println("║ Filename: " + String(testConfig.filename) + ".txt");
+  Serial.println("║ Weight:   " + String(testConfig.totalWeight, 1) + " kg");
+  Serial.println("║ Wind:     " + String(testConfig.windSpeed, 1) + " m/s");
+  Serial.println("║ Height:   " + String(testConfig.height, 1) + " m");
+  Serial.println("╚════════════════════════════════╝");
+  Serial.println("");
+  Serial.println("⚠️  In FLIGHT mode you can:");
+  Serial.println("   • Start/Stop data logging");
+  Serial.println("   • Fire pyro channels");
+  Serial.println("   • Reset sensor origins");
+  Serial.println("");
+  Serial.print("✅ Proceed to FLIGHT mode? (y/n): ");
   
-  // Mode-specific initialization
-  if (currentMode == MODE_FLIGHT && !configurationSent) {
-    sendConfigurationToTX();
+  String confirmation = getMenuTextInput();
+  confirmation.toLowerCase();
+  
+  if (confirmation == "y" || confirmation == "yes") {
+    Serial.println("\n🚀 Switching to FLIGHT mode...");
+    switchMode(MODE_FLIGHT);
+    
+    // Send configuration to TX if not already sent
+    if (!configurationSent) {
+      Serial.println("📤 Auto-sending configuration to TX...");
+      sendConfigurationToTX();
+      configurationSent = true;
+    }
+    
+    Serial.println("✅ FLIGHT mode activated - Ready for operations!");
+    return true;
+  } else {
+    Serial.println("\n❌ Flight mode entry cancelled");
+    Serial.println("💡 Staying in current mode - use menus to modify config if needed");
+    return false;
+  }
+}
+
+void switchMode(GroundStationMode newMode) {
+  // Direct mode switching (used internally, no validation)
+  GroundStationMode previousMode = currentMode;
+  currentMode = newMode;
+  
+  if (previousMode != newMode) {
+    Serial.print("✅ Mode switched: ");
+    switch(previousMode) {
+      case MODE_CONFIG: Serial.print("CONFIG"); break;
+      case MODE_FLIGHT: Serial.print("FLIGHT"); break;
+      case MODE_DATA_RECOVERY: Serial.print("DATA RECOVERY"); break;
+      case MODE_LOAD_CALIBRATION: Serial.print("LOAD CALIBRATION"); break;
+    }
+    Serial.print(" → ");
+    printCurrentMode();
   }
 }
 
@@ -690,45 +803,834 @@ void sendLoRaCommandNow(String command) {
 void sendConfigurationToTX() {
   if (!isConfigComplete()) {
     Serial.println("❌ Configuration incomplete - cannot send to TX");
+    Serial.println("📋 Missing parameters:");
+    if (testConfig.filename.isEmpty()) Serial.println("   • Filename");
+    if (testConfig.totalWeight <= 0) Serial.println("   • Weight");
+    if (testConfig.windSpeed < 0) Serial.println("   • Wind Speed");
+    if (testConfig.height <= 0) Serial.println("   • Height");
     return;
   }
   
   Serial.println("📤 Sending configuration to TX...");
   Serial.println("   📋 Configuration Details:");
-  Serial.println("   • Filename: " + testConfig.filename + ".txt");
-  Serial.println("   • Weight: " + String(testConfig.totalWeight, 2) + " kg");
-  Serial.println("   • Wind: " + String(testConfig.windSpeed, 2) + " m/s");
-  Serial.println("   • Height: " + String(testConfig.height, 2) + " m");
+  Serial.println("   • Filename: '" + testConfig.filename + "' → will be sent as 'FILENAME:" + testConfig.filename + "'");
+  Serial.println("   • Weight: " + String(testConfig.totalWeight, 2) + " kg → will be sent as 'WEIGHT:" + String(testConfig.totalWeight, 2) + "'");
+  Serial.println("   • Wind: " + String(testConfig.windSpeed, 2) + " m/s → will be sent as 'WIND:" + String(testConfig.windSpeed, 2) + "'");
+  Serial.println("   • Height: " + String(testConfig.height, 2) + " m → will be sent as 'HEIGHT:" + String(testConfig.height, 2) + "'");
   Serial.println("");
   
-  // Send configuration commands immediately and synchronously
-  Serial.println("� Step 1: Initialize configuration mode");
+  // Validate filename before sending
+  if (testConfig.filename.isEmpty()) {
+    Serial.println("❌ CRITICAL ERROR: Filename is empty! Cannot send configuration.");
+    return;
+  }
+  
+  // Send configuration commands with better spacing and validation
+  Serial.println("➤ Step 1: Initialize configuration mode");
   sendLoRaCommandNow("CONFIG_START");
-  delay(500);  // Allow TX to enter config mode
+  delay(700);  // Longer delay to ensure TX enters config mode
   
-  Serial.println("� Step 2: Send filename");  
-  sendLoRaCommandNow("FILENAME:" + testConfig.filename);
-  delay(300);  // Allow TX to process filename
+  Serial.println("➤ Step 2: Send filename");  
+  String filenameCmd = "FILENAME:" + testConfig.filename;
+  Serial.println("   📡 Sending: '" + filenameCmd + "'");
+  sendLoRaCommandNow(filenameCmd);
+  delay(500);  // Longer delay for filename processing
   
-  Serial.println("� Step 3: Send weight");
-  sendLoRaCommandNow("WEIGHT:" + String(testConfig.totalWeight, 2));
-  delay(300);  // Allow TX to process weight
+  Serial.println("➤ Step 3: Send weight");
+  String weightCmd = "WEIGHT:" + String(testConfig.totalWeight, 2);
+  Serial.println("   📡 Sending: '" + weightCmd + "'");
+  sendLoRaCommandNow(weightCmd);
+  delay(500);  // Longer delay for weight processing
   
-  Serial.println("� Step 4: Send wind speed");
-  sendLoRaCommandNow("WIND:" + String(testConfig.windSpeed, 2));
-  delay(300);  // Allow TX to process wind speed
+  Serial.println("➤ Step 4: Send wind speed");
+  String windCmd = "WIND:" + String(testConfig.windSpeed, 2);
+  Serial.println("   📡 Sending: '" + windCmd + "'");
+  sendLoRaCommandNow(windCmd);
+  delay(500);  // Longer delay for wind processing
   
-  Serial.println("� Step 5: Send height");
-  sendLoRaCommandNow("HEIGHT:" + String(testConfig.height, 2));
-  delay(300);  // Allow TX to process height
+  Serial.println("➤ Step 5: Send height");
+  String heightCmd = "HEIGHT:" + String(testConfig.height, 2);
+  Serial.println("   📡 Sending: '" + heightCmd + "'");
+  sendLoRaCommandNow(heightCmd);
+  delay(500);  // Longer delay for height processing
   
-  Serial.println("� Step 6: Finalize configuration");
+  Serial.println("➤ Step 6: Finalize configuration");
   sendLoRaCommandNow("CONFIG_READY");
-  delay(200);  // Allow final processing
+  delay(300);  // Allow final processing
   
   configurationSent = true;
   Serial.println("");
   Serial.println("✅ Configuration transmission sequence complete!");
-  Serial.println("🔍 Check TX serial monitor - should show all 6 commands received");
-  Serial.println("📊 Commands sent: CONFIG_START → FILENAME → WEIGHT → WIND → HEIGHT → CONFIG_READY");
+  Serial.println("🔍 Check TX serial monitor for all 6 commands:");
+  Serial.println("   1. CONFIG_START");
+  Serial.println("   2. " + filenameCmd);
+  Serial.println("   3. " + weightCmd);
+  Serial.println("   4. " + windCmd);
+  Serial.println("   5. " + heightCmd);
+  Serial.println("   6. CONFIG_READY");
+  Serial.println("");
+  Serial.println("⚠️  If any command is missing on TX, it might be LoRa packet loss.");
+  Serial.println("💡 Try sending configuration again if TX doesn't show all commands.");
+}
+
+// === MENU SYSTEM IMPLEMENTATION ===
+
+void enterMenuMode() {
+  menuMode = true;
+  currentMenuLevel = MENU_MAIN;
+  Serial.println("\n🎛️ === ENTERING INTERACTIVE MENU MODE ===");
+  Serial.println("💡 Use numbers to navigate, 'b' to go back, 'q' to quit menus");
+  printMainMenu();
+}
+
+void exitMenuMode() {
+  menuMode = false;
+  Serial.println("\n✅ Exited menu mode - back to text commands");
+  Serial.println("💡 Type 'menu' to return to menus or 'help' for text commands\n");
+}
+
+void processMenuInput(String input) {
+  input.trim();
+  input.toLowerCase();
+  
+  // Global menu commands
+  if (input == "q" || input == "quit") {
+    exitMenuMode();
+    return;
+  }
+  else if (input == "b" || input == "back") {
+    handleBackNavigation();
+    return;
+  }
+  else if (input == "h" || input == "help") {
+    printMenuHelp();
+    return;
+  }
+  
+  // Handle menu-specific input
+  switch (currentMenuLevel) {
+    case MENU_MAIN:
+      processMainMenuInput(input);
+      break;
+    case MENU_CONFIG:
+      processConfigMenuInput(input);
+      break;
+    case MENU_FLIGHT:
+      processFlightMenuInput(input);
+      break;
+    case MENU_DATA:
+      processDataMenuInput(input);
+      break;
+    case MENU_CALIBRATION:
+      processCalibrationMenuInput(input);
+      break;
+    case MENU_SET_PARAMS:
+      processSetParamsMenuInput(input);
+      break;
+  }
+}
+
+void handleBackNavigation() {
+  switch (currentMenuLevel) {
+    case MENU_MAIN:
+      exitMenuMode();
+      break;
+    case MENU_CONFIG:
+    case MENU_FLIGHT:
+    case MENU_DATA:
+    case MENU_CALIBRATION:
+      // When going back to main menu, don't auto-switch modes
+      // Let the user see their current mode on the main menu
+      currentMenuLevel = MENU_MAIN;
+      Serial.println("🔙 Returning to main menu...");
+      printMainMenu();
+      break;
+    case MENU_SET_PARAMS:
+      currentMenuLevel = MENU_CONFIG;
+      // Ensure we're in config mode when in config menu
+      if (currentMode != MODE_CONFIG) {
+        Serial.println("🔄 Returning to CONFIG mode...");
+        switchMode(MODE_CONFIG);
+      }
+      printConfigMenu();
+      break;
+  }
+}
+
+void printMenuHelp() {
+  Serial.println("\n📚 === MENU NAVIGATION HELP ===");
+  Serial.println("Numbers (1,2,3...): Select menu option");
+  Serial.println("'b' or 'back':     Go back to previous menu");
+  Serial.println("'q' or 'quit':     Exit menu mode");
+  Serial.println("'h' or 'help':     Show this help");
+  Serial.println("===============================");
+  
+  // Reprint current menu
+  switch (currentMenuLevel) {
+    case MENU_MAIN: printMainMenu(); break;
+    case MENU_CONFIG: printConfigMenu(); break;
+    case MENU_FLIGHT: printFlightMenu(); break;
+    case MENU_DATA: printDataMenu(); break;
+    case MENU_CALIBRATION: printCalibrationMenu(); break;
+    case MENU_SET_PARAMS: printSetParamsMenu(); break;
+  }
+}
+
+// === MAIN MENU ===
+void printMainMenu() {
+  Serial.println("\n🎛️ === MAIN MENU ===");
+  printCurrentMode();
+  
+  // Show config status
+  if (isConfigComplete()) {
+    Serial.println("Config Status: ✅ Complete");
+  } else {
+    Serial.println("Config Status: ❌ Incomplete");
+  }
+  Serial.println("");
+  
+  Serial.println("Menu Navigation (will switch modes automatically):");
+  Serial.println("1. 📋 Configuration Setup → CONFIG mode");
+  Serial.println(String("2. 🚀 Flight Operations → FLIGHT mode ") + (isConfigComplete() ? "✅" : "❌"));
+  Serial.println("3. 💾 Data Recovery → DATA RECOVERY mode");
+  Serial.println("4. ⚖️  Load Cell Calibration → CALIBRATION mode");
+  Serial.println("");
+  Serial.println("Quick Actions (stay in current mode):");
+  Serial.println("5. 📡 Test LoRa Connection");
+  Serial.println("6. 📊 System Status");
+  Serial.println("");
+  Serial.println("'q' = Quit menus  |  'h' = Help");
+  Serial.print("Choice: ");
+}
+
+void processMainMenuInput(String input) {
+  int choice = input.toInt();
+  
+  switch (choice) {
+    case 1:
+      // Switch to CONFIG mode and menu
+      if (currentMode != MODE_CONFIG) {
+        Serial.println("🔄 Switching to CONFIG mode...");
+        switchMode(MODE_CONFIG);
+      }
+      currentMenuLevel = MENU_CONFIG;
+      printConfigMenu();
+      break;
+    case 2:
+      // Switch to FLIGHT mode with validation
+      if (attemptFlightModeSwitch()) {
+        currentMenuLevel = MENU_FLIGHT;
+        printFlightMenu();
+      } else {
+        // Stay on main menu if flight mode switch failed
+        printMainMenu();
+      }
+      break;
+    case 3:
+      // Switch to DATA RECOVERY mode and menu
+      if (currentMode != MODE_DATA_RECOVERY) {
+        Serial.println("🔄 Switching to DATA RECOVERY mode...");
+        switchMode(MODE_DATA_RECOVERY);
+      }
+      currentMenuLevel = MENU_DATA;
+      printDataMenu();
+      break;
+    case 4:
+      // Switch to LOAD CALIBRATION mode and menu
+      if (currentMode != MODE_LOAD_CALIBRATION) {
+        Serial.println("🔄 Switching to LOAD CALIBRATION mode...");
+        switchMode(MODE_LOAD_CALIBRATION);
+      }
+      currentMenuLevel = MENU_CALIBRATION;
+      printCalibrationMenu();
+      break;
+    case 5:
+      Serial.println("\n📡 Testing LoRa connection...");
+      sendCommandToFlightComputer("PING");
+      Serial.println("✅ PING sent - check TX response");
+      printMainMenu();
+      break;
+    case 6:
+      printGroundStationStatus();
+      printMainMenu();
+      break;
+    default:
+      Serial.println("❌ Invalid choice. Enter 1-6, 'b' for back, or 'q' to quit.");
+      Serial.print("Choice: ");
+      break;
+  }
+}
+
+// === CONFIGURATION MENU ===
+void printConfigMenu() {
+  Serial.println("\n📋 === CONFIGURATION SETUP ===");
+  
+  // Show current config status
+  Serial.println("Current Configuration:");
+  Serial.println("• Filename: " + (testConfig.filename.isEmpty() ? "❌ Not set" : "✅ " + testConfig.filename));
+  Serial.println("• Weight: " + (testConfig.totalWeight <= 0 ? "❌ Not set" : "✅ " + String(testConfig.totalWeight, 1) + " kg"));
+  Serial.println("• Wind Speed: " + (testConfig.windSpeed < 0 ? "❌ Not set" : "✅ " + String(testConfig.windSpeed, 1) + " m/s"));
+  Serial.println("• Height: " + (testConfig.height <= 0 ? "❌ Not set" : "✅ " + String(testConfig.height, 1) + " m"));
+  Serial.println("");
+  
+  Serial.println("Options:");
+  Serial.println("1. 📝 Set Test Parameters");
+  Serial.println("2. 📋 Show Full Configuration");
+  Serial.println("3. 📤 Send Config to TX");
+  Serial.println("4. 🚀 Enter Flight Mode");
+  Serial.println("");
+  Serial.println("'b' = Back to Main  |  'q' = Quit menus");
+  Serial.print("Choice: ");
+}
+
+void processConfigMenuInput(String input) {
+  int choice = input.toInt();
+  
+  switch (choice) {
+    case 1:
+      currentMenuLevel = MENU_SET_PARAMS;
+      printSetParamsMenu();
+      break;
+    case 2:
+      showConfiguration();
+      printConfigMenu();
+      break;
+    case 3:
+      if (isConfigComplete()) {
+        Serial.println("📤 Sending configuration to TX...");
+        sendConfigurationToTX();
+        configurationSent = true;
+        Serial.println("✅ Configuration sent successfully!");
+      } else {
+        Serial.println("❌ Configuration incomplete - cannot send to TX");
+        Serial.println("💡 Use option 1 to set missing parameters");
+      }
+      printConfigMenu();
+      break;
+    case 4:
+      // Attempt to switch to flight mode with validation and confirmation
+      if (attemptFlightModeSwitch()) {
+        currentMenuLevel = MENU_FLIGHT;
+        printFlightMenu();
+      } else {
+        // Stay in config menu if flight mode switch failed
+        printConfigMenu();
+      }
+      break;
+    default:
+      Serial.println("❌ Invalid choice. Enter 1-4, 'b' for back, or 'q' to quit.");
+      Serial.print("Choice: ");
+      break;
+  }
+}
+
+// === SET PARAMETERS SUBMENU ===
+void printSetParamsMenu() {
+  Serial.println("\n📝 === SET TEST PARAMETERS ===");
+  Serial.println("1. ⚙️ Set All Parameters (Quick Setup)");
+  Serial.println("2. 📁 Set Filename Only");
+  Serial.println("3. ⚖️  Set Total Weight Only");
+  Serial.println("4. 🌬️  Set Wind Speed Only");
+  Serial.println("5. 📏 Set Height Only");
+  Serial.println("");
+  Serial.println("'b' = Back to Config  |  'q' = Quit menus");
+  Serial.print("Choice: ");
+}
+
+void processSetParamsMenuInput(String input) {
+  int choice = input.toInt();
+  
+  switch (choice) {
+    case 1:
+      promptForAllParameters();
+      break;
+    case 2:
+      promptForFilename();
+      break;
+    case 3:
+      promptForWeight();
+      break;
+    case 4:
+      promptForWindSpeed();
+      break;
+    case 5:
+      promptForHeight();
+      break;
+    default:
+      Serial.println("❌ Invalid choice. Enter 1-5, 'b' for back, or 'q' to quit.");
+      Serial.print("Choice: ");
+      break;
+  }
+}
+
+// === FLIGHT OPERATIONS MENU ===
+void printFlightMenu() {
+  Serial.println("\n🚀 === FLIGHT OPERATIONS ===");
+  
+  // Show current mode status
+  Serial.print("Current Mode: ");
+  printCurrentMode();
+  
+  if (currentMode != MODE_FLIGHT) {
+    Serial.println("⚠️ Warning: Menu and mode mismatch!");
+    Serial.println("💡 This should not happen - please report this issue");
+    Serial.println("");
+  }
+  
+  // Show flight status
+  if (flightModeActive) {
+    Serial.println("Flight Status: 🟢 ACTIVE LOGGING - Data recording in progress");
+  } else {
+    Serial.println("Flight Status: 🟡 Ready to start - Configuration loaded");
+  }
+  
+  // Show current config summary
+  if (isConfigComplete()) {
+    Serial.println("Config: ✅ " + testConfig.filename + " | " + String(testConfig.totalWeight, 1) + "kg | " + String(testConfig.height, 1) + "m");
+  } else {
+    Serial.println("Config: ❌ Incomplete (this should not happen in flight mode!)");
+  }
+  Serial.println("");
+  
+  Serial.println("1. 🚀 Start Data Logging");
+  Serial.println("2. 🛑 Stop Data Logging");
+  Serial.println("3. 🎯 Reset Sensor Origins");
+  Serial.println("4. 💥 Fire Pyro Channel");
+  Serial.println("5. 📋 Return to Config Mode");
+  Serial.println("");
+  Serial.println("'b' = Back to Main  |  'q' = Quit menus");
+  Serial.print("Choice: ");
+}
+
+void processFlightMenuInput(String input) {
+  int choice = input.toInt();
+  
+  switch (choice) {
+    case 1:
+      Serial.println("🚀 Starting data logging...");
+      sendCommandToFlightComputer("FLIGHT_START");
+      flightModeActive = true;
+      printFlightMenu();
+      break;
+    case 2:
+      Serial.println("🛑 Stopping data logging...");
+      sendCommandToFlightComputer("FLIGHT_STOP");
+      flightModeActive = false;
+      printFlightMenu();
+      break;
+    case 3:
+      Serial.println("🎯 Resetting sensor zero points...");
+      sendCommandToFlightComputer("SENSOR_RESET");
+      printFlightMenu();
+      break;
+    case 4:
+      showPyroMenu();
+      break;
+    case 5:
+      // Return to config mode with confirmation if flight is active
+      if (flightModeActive) {
+        Serial.println("\n⚠️ === FLIGHT ACTIVE WARNING ===");
+        Serial.println("Data logging is currently active!");
+        Serial.println("Switching to CONFIG mode will stop flight operations.");
+        Serial.print("Continue anyway? (y/n): ");
+        
+        String confirmation = getMenuTextInput();
+        confirmation.toLowerCase();
+        
+        if (confirmation == "y" || confirmation == "yes") {
+          Serial.println("🛑 Stopping flight operations...");
+          sendCommandToFlightComputer("FLIGHT_STOP");
+          flightModeActive = false;
+          Serial.println("🔄 Switching to CONFIG mode...");
+          switchMode(MODE_CONFIG);
+          currentMenuLevel = MENU_CONFIG;
+          printConfigMenu();
+        } else {
+          Serial.println("❌ Mode switch cancelled - staying in FLIGHT mode");
+          printFlightMenu();
+        }
+      } else {
+        Serial.println("🔄 Returning to CONFIG mode...");
+        switchMode(MODE_CONFIG);
+        currentMenuLevel = MENU_CONFIG;
+        printConfigMenu();
+      }
+      break;
+    default:
+      Serial.println("❌ Invalid choice. Enter 1-5, 'b' for back, or 'q' to quit.");
+      Serial.print("Choice: ");
+      break;
+  }
+}
+
+// === DATA RECOVERY MENU ===
+void printDataMenu() {
+  Serial.println("\n💾 === DATA RECOVERY ===");
+  Serial.println("1. 📶 Start WiFi on TX");
+  Serial.println("2. 📶 Stop WiFi on TX");
+  Serial.println("3. 📁 Request File List from TX");
+  Serial.println("4. 🌐 Open WiFi Instructions");
+  Serial.println("");
+  Serial.println("'b' = Back to Main  |  'q' = Quit menus");
+  Serial.print("Choice: ");
+}
+
+void processDataMenuInput(String input) {
+  int choice = input.toInt();
+  
+  switch (choice) {
+    case 1:
+      Serial.println("📶 Starting WiFi on TX for file download...");
+      sendCommandToFlightComputer("WIFI_START");
+      Serial.println("💡 TX should start WiFi SoftAP - check TX serial output");
+      printDataMenu();
+      break;
+    case 2:
+      Serial.println("📶 Stopping WiFi on TX...");
+      sendCommandToFlightComputer("WIFI_STOP");
+      printDataMenu();
+      break;
+    case 3:
+      Serial.println("📁 Requesting file list from TX...");
+      sendCommandToFlightComputer("FILE_LIST");
+      printDataMenu();
+      break;
+    case 4:
+      printWiFiInstructions();
+      printDataMenu();
+      break;
+    default:
+      Serial.println("❌ Invalid choice. Enter 1-4, 'b' for back, or 'q' to quit.");
+      Serial.print("Choice: ");
+      break;
+  }
+}
+
+// === CALIBRATION MENU ===
+void printCalibrationMenu() {
+  Serial.println("\n⚖️ === LOAD CELL CALIBRATION ===");
+  Serial.println("1. 🔧 Start Calibration Process");
+  Serial.println("2. ⚖️  Set Zero Point (No Load)");
+  Serial.println("3. 📏 Set Known Weight Point");
+  Serial.println("4. 💾 Save Calibration");
+  Serial.println("5. 🧪 Test Current Calibration");
+  Serial.println("");
+  Serial.println("'b' = Back to Main  |  'q' = Quit menus");
+  Serial.print("Choice: ");
+}
+
+void processCalibrationMenuInput(String input) {
+  int choice = input.toInt();
+  
+  switch (choice) {
+    case 1:
+      Serial.println("⚖️ Starting load cell calibration process...");
+      sendCommandToFlightComputer("CALIB_START");
+      printCalibrationMenu();
+      break;
+    case 2:
+      Serial.println("⚖️ Setting zero point (ensure no load on cell)...");
+      sendCommandToFlightComputer("CALIB_ZERO");
+      printCalibrationMenu();
+      break;
+    case 3:
+      promptForCalibrationWeight();
+      break;
+    case 4:
+      Serial.println("⚖️ Saving calibration constants...");
+      sendCommandToFlightComputer("CALIB_SAVE");
+      printCalibrationMenu();
+      break;
+    case 5:
+      Serial.println("⚖️ Testing current calibration...");
+      sendCommandToFlightComputer("CALIB_TEST");
+      printCalibrationMenu();
+      break;
+    default:
+      Serial.println("❌ Invalid choice. Enter 1-5, 'b' for back, or 'q' to quit.");
+      Serial.print("Choice: ");
+      break;
+  }
+}
+
+// === PARAMETER INPUT FUNCTIONS ===
+void promptForAllParameters() {
+  Serial.println("\n🚀 === QUICK SETUP - ALL PARAMETERS ===");
+  Serial.println("Enter all test parameters in sequence:");
+  Serial.println("(Press Enter after each parameter, or type 'skip' to keep current value)\n");
+  
+  // 1. Filename
+  Serial.print("📁 Filename");
+  if (!testConfig.filename.isEmpty()) {
+    Serial.print(" (current: " + testConfig.filename + ")");
+  }
+  Serial.print(": ");
+  
+  String filename = getMenuTextInput();
+  filename.toLowerCase();
+  if (filename.length() > 0 && filename != "skip") {
+    testConfig.filename = filename;
+    Serial.println("   ✅ Filename set to: " + filename + ".txt");
+  } else {
+    Serial.println("   ⏭️  Filename unchanged");
+  }
+  
+  // 2. Weight
+  Serial.print("\n⚖️  Total Weight (kg)");
+  if (testConfig.totalWeight > 0) {
+    Serial.print(" (current: " + String(testConfig.totalWeight, 1) + " kg)");
+  }
+  Serial.print(": ");
+  
+  String weightInput = getMenuTextInput();
+  weightInput.toLowerCase();
+  if (weightInput.length() > 0 && weightInput != "skip") {
+    float weight = weightInput.toFloat();
+    if (weight > 0) {
+      testConfig.totalWeight = weight;
+      Serial.println("   ✅ Weight set to: " + String(weight, 2) + " kg");
+    } else {
+      Serial.println("   ❌ Invalid weight - keeping previous value");
+    }
+  } else {
+    Serial.println("   ⏭️  Weight unchanged");
+  }
+  
+  // 3. Wind Speed
+  Serial.print("\n🌬️  Wind Speed (m/s)");
+  if (testConfig.windSpeed >= 0) {
+    Serial.print(" (current: " + String(testConfig.windSpeed, 1) + " m/s)");
+  }
+  Serial.print(": ");
+  
+  String windInput = getMenuTextInput();
+  windInput.toLowerCase();
+  if (windInput.length() > 0 && windInput != "skip") {
+    float wind = windInput.toFloat();
+    if (wind >= 0) {
+      testConfig.windSpeed = wind;
+      Serial.println("   ✅ Wind speed set to: " + String(wind, 2) + " m/s");
+    } else {
+      Serial.println("   ❌ Invalid wind speed - keeping previous value");
+    }
+  } else {
+    Serial.println("   ⏭️  Wind speed unchanged");
+  }
+  
+  // 4. Height
+  Serial.print("\n📏 Height (m)");
+  if (testConfig.height > 0) {
+    Serial.print(" (current: " + String(testConfig.height, 1) + " m)");
+  }
+  Serial.print(": ");
+  
+  String heightInput = getMenuTextInput();
+  heightInput.toLowerCase();
+  if (heightInput.length() > 0 &&  heightInput != "skip") {
+    float height = heightInput.toFloat();
+    if (height > 0) {
+      testConfig.height = height;
+      Serial.println("   ✅ Height set to: " + String(height, 2) + " m");
+    } else {
+      Serial.println("   ❌ Invalid height - keeping previous value");
+    }
+  } else {
+    Serial.println("   ⏭️  Height unchanged");
+  }
+  
+  // Summary
+  Serial.println("\n🎯 === CONFIGURATION SUMMARY ===");
+  Serial.println("• Filename: " + (testConfig.filename.isEmpty() ? "❌ Not set" : "✅ " + testConfig.filename + ".txt"));
+  Serial.println("• Weight: " + (testConfig.totalWeight <= 0 ? "❌ Not set" : "✅ " + String(testConfig.totalWeight, 1) + " kg"));
+  Serial.println("• Wind Speed: " + (testConfig.windSpeed < 0 ? "❌ Not set" : "✅ " + String(testConfig.windSpeed, 1) + " m/s"));
+  Serial.println("• Height: " + (testConfig.height <= 0 ? "❌ Not set" : "✅ " + String(testConfig.height, 1) + " m"));
+  Serial.println("");
+  
+  if (isConfigComplete()) {
+    Serial.println("🎉 Configuration is COMPLETE and ready!");
+    Serial.println("💡 You can now send this config to TX or enter flight mode");
+  } else {
+    Serial.println("⚠️  Configuration is still incomplete");
+    Serial.println("💡 Use individual parameter options to set missing values");
+  }
+  
+  Serial.println("================================");
+  
+  // Return to config menu
+  currentMenuLevel = MENU_CONFIG;
+  printConfigMenu();
+}
+
+void promptForFilename() {
+  Serial.println("\n📁 === SET FILENAME ===");
+  Serial.println("Enter test filename (will be saved as filename.txt):");
+  Serial.print("Filename: ");
+  
+  String filename = getMenuTextInput();
+  if (filename.length() > 0) {
+    testConfig.filename = filename;
+    Serial.println("✅ Filename set to: " + filename + ".txt");
+  } else {
+    Serial.println("❌ Invalid filename");
+  }
+  
+  currentMenuLevel = MENU_CONFIG;
+  printConfigMenu();
+}
+
+void promptForWeight() {
+  Serial.println("\n⚖️ === SET TOTAL WEIGHT ===");
+  Serial.println("Enter total weight in kilograms:");
+  Serial.print("Weight (kg): ");
+  
+  String input = getMenuTextInput();
+  float weight = input.toFloat();
+  if (weight > 0) {
+    testConfig.totalWeight = weight;
+    Serial.println("✅ Weight set to: " + String(weight, 2) + " kg");
+  } else {
+    Serial.println("❌ Invalid weight");
+  }
+  
+  currentMenuLevel = MENU_CONFIG;
+  printConfigMenu();
+}
+
+void promptForWindSpeed() {
+  Serial.println("\n🌬️ === SET WIND SPEED ===");
+  Serial.println("Enter wind speed in m/s:");
+  Serial.print("Wind speed (m/s): ");
+  
+  String input = getMenuTextInput();
+  float wind = input.toFloat();
+  if (wind >= 0) {
+    testConfig.windSpeed = wind;
+    Serial.println("✅ Wind speed set to: " + String(wind, 2) + " m/s");
+  } else {
+    Serial.println("❌ Invalid wind speed");
+  }
+  
+  currentMenuLevel = MENU_CONFIG;
+  printConfigMenu();
+}
+
+void promptForHeight() {
+  Serial.println("\n📏 === SET HEIGHT ===");
+  Serial.println("Enter height in meters:");
+  Serial.print("Height (m): ");
+  
+  String input = getMenuTextInput();
+  float height = input.toFloat();
+  if (height > 0) {
+    testConfig.height = height;
+    Serial.println("✅ Height set to: " + String(height, 2) + " m");
+  } else {
+    Serial.println("❌ Invalid height");
+  }
+  
+  currentMenuLevel = MENU_CONFIG;
+  printConfigMenu();
+}
+
+void promptForCalibrationWeight() {
+  Serial.println("\n📏 === SET CALIBRATION WEIGHT ===");
+  Serial.println("Place known weight on load cell, then enter its value:");
+  Serial.print("Calibration weight (kg): ");
+  
+  String input = getMenuTextInput();
+  float weight = input.toFloat();
+  if (weight > 0) {
+    Serial.println("⚖️ Setting calibration weight: " + String(weight, 2) + " kg");
+    sendCommandToFlightComputer("CALIB_WEIGHT:" + String(weight, 2));
+    Serial.println("✅ Calibration weight command sent");
+  } else {
+    Serial.println("❌ Invalid weight");
+  }
+  
+  printCalibrationMenu();
+}
+
+void showPyroMenu() {
+  Serial.println("\n💥 === PYRO CHANNEL SELECTION ===");
+  Serial.println("⚠️  WARNING: This will fire a pyro channel!");
+  Serial.println("");
+  Serial.println("1. 💥 Fire Pyro Channel 1");
+  Serial.println("2. 💥 Fire Pyro Channel 2");
+  Serial.println("3. 💥 Fire Pyro Channel 3");
+  Serial.println("4. 💥 Fire Pyro Channel 4");
+  Serial.println("5. ❌ Cancel");
+  Serial.println("");
+  Serial.print("Choice (1-5): ");
+  
+  String input = getMenuTextInput();
+  int choice = input.toInt();
+  
+  if (choice >= 1 && choice <= 4) {
+    String pyroCmd = "PYRO" + String(choice);
+    Serial.println("💥 *** PYRO COMMAND WARNING ***");
+    Serial.println("About to send: " + pyroCmd);
+    Serial.println("This will fire a pyro channel on the flight computer!");
+    Serial.print("Type 'FIRE' to confirm or anything else to cancel: ");
+    
+    String confirmation = getMenuTextInput();
+    confirmation.toUpperCase();
+    
+    if (confirmation == "FIRE") {
+      Serial.println("💥 FIRING PYRO CHANNEL " + String(choice) + "!");
+      sendCommandToFlightComputer(pyroCmd);
+    } else {
+      Serial.println("❌ Pyro command cancelled");
+    }
+  } else if (choice == 5) {
+    Serial.println("❌ Pyro operation cancelled");
+  } else {
+    Serial.println("❌ Invalid choice");
+  }
+  
+  printFlightMenu();
+}
+
+void printWiFiInstructions() {
+  Serial.println("\n🌐 === WIFI CONNECTION INSTRUCTIONS ===");
+  Serial.println("1. Send 'Start WiFi on TX' command (option 1)");
+  Serial.println("2. Wait for TX to start WiFi SoftAP");
+  Serial.println("3. On your computer/phone, look for WiFi network:");
+  Serial.println("   • Network: 'Pavi-FlightComputer'");
+  Serial.println("   • Password: 'pavitest123'");
+  Serial.println("4. Connect to this network");
+  Serial.println("5. Open browser and go to: http://192.168.4.1 \nOR\n");
+  Serial.println("6. Open browser and go to: http://paviflightdata.local");
+  Serial.println("7. Use the web interface to download files");
+  Serial.println("8. When done, use 'Stop WiFi on TX' (option 2)");
+  Serial.println("================================================");
+}
+
+String getMenuTextInput() {
+  String input = "";
+  unsigned long timeout = millis() + 30000; // 30 second timeout
+  
+  while (millis() < timeout) {
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        Serial.println(); // New line
+        break;
+      } else if (c == '\b' || c == 127) { // Backspace
+        if (input.length() > 0) {
+          input.remove(input.length() - 1);
+          Serial.print("\b \b"); // Clear character
+        }
+      } else {
+        input += c;
+        Serial.print(c); // Echo
+      }
+    }
+  }
+  
+  if (millis() >= timeout) {
+    Serial.println("\n❌ Input timeout");
+  }
+  
+  input.trim();
+  return input;
 }
