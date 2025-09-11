@@ -1204,8 +1204,7 @@ void printFlightMenu() {
 
 void processFlightMenuInput(String input) {
   int choice = input.toInt();
-  
-  switch (choice) {
+    switch (choice) {
     case 1:
       Serial.println("🚀 Starting data logging...");
       sendCommandToFlightComputer("FLIGHT_START");
