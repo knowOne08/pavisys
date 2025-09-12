@@ -6,6 +6,17 @@
 #define RST   D1   // IO2
 #define DIO0  D0   // IO3
 
+// === ESP32-C3 STABILITY CONFIGURATION ===
+// ESP32-C3 has less RAM and different memory management than ESP32-WROOM-32
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+  #define ESP32_C3_FIXES_ENABLED true
+  #define ESP32_C3_EMERGENCY_MODE true  // Aggressive memory conservation
+  #pragma message "ESP32-C3 EMERGENCY STABILITY MODE enabled"
+#else
+  #define ESP32_C3_FIXES_ENABLED false
+  #define ESP32_C3_EMERGENCY_MODE false
+#endif
+
 // === GROUND STATION CONFIGURATION ===
 // Test mode - set to true to test serial only, false for full LoRa operation
 #define SERIAL_TEST_MODE false
@@ -83,6 +94,7 @@ void enterMenuMode();
 void exitMenuMode();
 void processMenuInput(String input);
 bool attemptFlightModeSwitch();
+void checkMemoryStatus(); // ESP32-C3 memory monitoring
 
 void setup() {
   Serial.begin(115200);
@@ -90,7 +102,18 @@ void setup() {
   
   Serial.println("=== RX: LoRa Ground Station (Serial Only) ===");
   Serial.println("ESP32-C3 initializing...");
-  Serial.print("Free heap: "); Serial.println(ESP.getFreeHeap());
+  
+  // ESP32-C3 Memory Status
+  uint32_t freeHeap = ESP.getFreeHeap();
+  Serial.print("Free heap: "); Serial.println(freeHeap);
+  
+  #if ESP32_C3_FIXES_ENABLED
+  if (freeHeap < 200000) {  // Less than 200KB
+    Serial.println("⚠️  WARNING: Low memory detected on ESP32-C3");
+    Serial.println("💡 ESP32-C3 stability fixes are ENABLED");
+  }
+  #endif
+  
   Serial.println("Serial command interface ready");
   
   if (SERIAL_TEST_MODE) {
@@ -153,6 +176,9 @@ void setup() {
 }
 
 void loop() {
+  // ESP32-C3 Memory monitoring
+  checkMemoryStatus();
+  
   // Process user commands from serial
   processUserCommands();
   
@@ -787,6 +813,17 @@ void sendLoRaCommandNow(String command) {
     return;
   }
   
+  // ESP32-C3 Stability Fix: Add watchdog feed and memory check
+  yield(); // Feed watchdog timer
+  
+  // Check free heap before transmission (ESP32-C3 safety)
+  if (ESP.getFreeHeap() < 50000) {  // Less than 50KB free
+    Serial.print("⚠️  Low memory detected: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes free");
+    delay(100); // Give system time to recover
+  }
+  
   // Send immediately via LoRa
   LoRa.beginPacket();
   LoRa.print(command);
@@ -798,6 +835,9 @@ void sendLoRaCommandNow(String command) {
   commandPacketCount++;
   lastTXResponse = "Command sent: " + command;
   lastCommandTime = millis();
+  
+  // ESP32-C3 Fix: Feed watchdog after transmission
+  yield();
 }
 
 void sendConfigurationToTX() {
@@ -829,34 +869,43 @@ void sendConfigurationToTX() {
   Serial.println("➤ Step 1: Initialize configuration mode");
   sendLoRaCommandNow("CONFIG_START");
   delay(700);  // Longer delay to ensure TX enters config mode
+  yield(); // ESP32-C3: Feed watchdog
   
   Serial.println("➤ Step 2: Send filename");  
+  // ESP32-C3 Fix: Reduce String operations
+  Serial.print("   📡 Sending: 'FILENAME:");
+  Serial.print(testConfig.filename);
+  Serial.println("'");
   String filenameCmd = "FILENAME:" + testConfig.filename;
-  Serial.println("   📡 Sending: '" + filenameCmd + "'");
   sendLoRaCommandNow(filenameCmd);
   delay(500);  // Longer delay for filename processing
+  yield(); // ESP32-C3: Feed watchdog
   
   Serial.println("➤ Step 3: Send weight");
   String weightCmd = "WEIGHT:" + String(testConfig.totalWeight, 2);
   Serial.println("   📡 Sending: '" + weightCmd + "'");
   sendLoRaCommandNow(weightCmd);
   delay(500);  // Longer delay for weight processing
+  yield(); // ESP32-C3: Feed watchdog
   
   Serial.println("➤ Step 4: Send wind speed");
   String windCmd = "WIND:" + String(testConfig.windSpeed, 2);
   Serial.println("   📡 Sending: '" + windCmd + "'");
   sendLoRaCommandNow(windCmd);
   delay(500);  // Longer delay for wind processing
+  yield(); // ESP32-C3: Feed watchdog
   
   Serial.println("➤ Step 5: Send height");
   String heightCmd = "HEIGHT:" + String(testConfig.height, 2);
   Serial.println("   📡 Sending: '" + heightCmd + "'");
   sendLoRaCommandNow(heightCmd);
   delay(500);  // Longer delay for height processing
+  yield(); // ESP32-C3: Feed watchdog
   
   Serial.println("➤ Step 6: Finalize configuration");
   sendLoRaCommandNow("CONFIG_READY");
   delay(300);  // Allow final processing
+  yield(); // ESP32-C3: Feed watchdog
   
   configurationSent = true;
   Serial.println("");
@@ -1632,4 +1681,26 @@ String getMenuTextInput() {
   
   input.trim();
   return input;
+}
+
+// ESP32-C3 Memory Monitoring Function
+void checkMemoryStatus() {
+  #if ESP32_C3_FIXES_ENABLED
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 10000) { // Check every 10 seconds
+    lastCheck = millis();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t minFreeHeap = ESP.getMinFreeHeap();
+    
+    if (freeHeap < 100000) { // Less than 100KB
+      Serial.println("🚨 CRITICAL: Low memory detected!");
+      Serial.print("   Free: "); Serial.print(freeHeap); Serial.println(" bytes");
+      Serial.print("   Min ever: "); Serial.print(minFreeHeap); Serial.println(" bytes");
+      Serial.println("   Consider reducing String operations or restarting");
+    } else if (freeHeap < 150000) { // Less than 150KB
+      Serial.println("⚠️  Warning: Memory getting low");
+      Serial.print("   Free: "); Serial.print(freeHeap); Serial.println(" bytes");
+    }
+  }
+  #endif
 }

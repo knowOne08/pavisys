@@ -134,10 +134,19 @@ GND          GND                Ground
 ### System Configuration Options
 
 #### TX (Flight Computer) Configuration
-```cpp
-// Data rate selection (TX_Pavi.ino)
-#define DATA_RATE_MODE 4        // 1=10Hz, 2=20Hz, 3=30Hz, 4=40Hz
 
+**Easy Flight Computer Selection:**
+```cpp
+// Change this single macro to switch between two FC builds (TX_Pavi.ino)
+#define FC_NO 1  // 1 = FC1 (20Hz, "PaviFlightData"), 2 = FC2 (40Hz, "PaviFlightData-2")
+```
+
+This automatically configures:
+- **FC1**: 20Hz data rate + "PaviFlightData" WiFi SSID
+- **FC2**: 40Hz data rate + "PaviFlightData-2" WiFi SSID
+
+**Other Configuration Options:**
+```cpp
 // Sensor enable/disable
 bool ENABLE_BAROMETER = true;
 bool ENABLE_ACCELEROMETER = true;
@@ -149,8 +158,7 @@ bool ENABLE_LOAD_CELL = true;
 #define SERIAL_TEST_MODE false  // Set true for testing without hardware
 #define PYRO_TEST_MODE false    // Set true for LED testing instead of pyro
 
-// WiFi SoftAP settings
-#define WIFI_SSID "PaviFlightData"
+// WiFi SoftAP settings (auto-configured by FC_NO)
 #define WIFI_PASSWORD ""        // Open network by default
 ```
 

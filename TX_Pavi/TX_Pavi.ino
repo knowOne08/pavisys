@@ -10,6 +10,30 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 
+
+// === FLIGHT COMPUTER CONFIGURATION ===
+// Change this single macro to switch between two FC builds
+#define FC_NO 1  // 1 = FC1 (20Hz, "PaviFlightData"), 2 = FC2 (40Hz, "PaviFlightData-2")
+
+// Auto-configure based on FC number
+#if FC_NO == 1
+  #define DATA_RATE_MODE 2        // 20Hz for FC1
+  #define WIFI_SSID "PaviFlightData"
+#elif FC_NO == 2  
+  #define DATA_RATE_MODE 4        // 40Hz for FC2
+  #define WIFI_SSID "PaviFlightData-2"
+#else
+  #error "Invalid FC_NO! Please set FC_NO to 1 or 2"
+#endif
+
+/*
+ * TO SWITCH BETWEEN FLIGHT COMPUTERS:
+ * 1. Change FC_NO to 1 or 2
+ * 2. That's it! The system automatically configures:
+ *    - FC1: 20Hz data rate + "PaviFlightData" WiFi SSID
+ *    - FC2: 40Hz data rate + "PaviFlightData-2" WiFi SSID
+ */
+
 // LoRa pin mapping
 #define NSS   5
 #define RST   17
@@ -33,9 +57,6 @@
 
 // Test mode for pyro channels - set to true to test LEDs
 #define PYRO_TEST_MODE false
-
-// SIMPLE RATE SELECTION - Choose your data rate
-#define DATA_RATE_MODE 4  // 1=10Hz, 2=20Hz, 3=30Hz, 4=40Hz
 
 // LORA TRANSMISSION CONTROL - TX is now pure command responder
 #define LORA_TRANSMISSION_MODE 0   // TX never sends unsolicited telemetry
@@ -116,7 +137,8 @@ int currentSubMenu = 0;
 #define MENU_CALIBRATION 4
 
 // === WIFI SOFTAP CONFIGURATION ===
-#define WIFI_SSID "PaviFlightData"
+// SSID is auto-configured based on FC_NO above
+
 #define WIFI_PASSWORD ""
 #define WIFI_CHANNEL 6
 #define MAX_CONNECTIONS 4
