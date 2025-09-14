@@ -11,11 +11,13 @@ PAVI is a dual-module flight system designed for parachute drop testing and expe
 - **Dual-Module Architecture**: Ground Station (RX) and Flight Computer (TX)
 - **LoRa Communication**: Long-range, reliable radio communication (433MHz)
 - **Multi-Sensor Data Logging**: Barometer, IMU, Load Cell integration
+- **Conditional Sensor Filtering**: Toggle between RAW and SMOOTH modes with a single macro
 - **Real-Time Flight Control**: Remote pyrotechnic channel control
 - **Web Interface**: WiFi-based file download and system management
 - **Robust Data Storage**: LittleFS filesystem with comprehensive logging
 - **Interactive Menu System**: User-friendly operation interface
 - **Configurable Data Rates**: 10Hz to 40Hz sensor sampling
+- **Multi-FC Support**: Easy switching between flight computer configurations
 
 ## 📁 Project Structure
 
