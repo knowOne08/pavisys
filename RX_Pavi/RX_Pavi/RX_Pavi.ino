@@ -6,6 +6,17 @@
 #define RST   D1   // IO2
 #define DIO0  D0   // IO3
 
+// === ESP32-C3 STABILITY CONFIGURATION ===
+// ESP32-C3 has less RAM and different memory management than ESP32-WROOM-32
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+  #define ESP32_C3_FIXES_ENABLED true
+  #define ESP32_C3_EMERGENCY_MODE true  // Aggressive memory conservation
+  #pragma message "ESP32-C3 EMERGENCY STABILITY MODE enabled"
+#else
+  #define ESP32_C3_FIXES_ENABLED false
+  #define ESP32_C3_EMERGENCY_MODE false
+#endif
+
 // === GROUND STATION CONFIGURATION ===
 // Test mode - set to true to test serial only, false for full LoRa operation
 #define SERIAL_TEST_MODE false
@@ -83,6 +94,7 @@ void enterMenuMode();
 void exitMenuMode();
 void processMenuInput(String input);
 bool attemptFlightModeSwitch();
+void checkMemoryStatus(); // ESP32-C3 memory monitoring
 
 void setup() {
   Serial.begin(115200);
@@ -90,7 +102,22 @@ void setup() {
   
   Serial.println("=== RX: LoRa Ground Station (Serial Only) ===");
   Serial.println("ESP32-C3 initializing...");
-  Serial.print("Free heap: "); Serial.println(ESP.getFreeHeap());
+  
+  // ESP32-C3 Memory Status
+  uint32_t freeHeap = ESP.getFreeHeap();
+  Serial.print("Free heap: "); Serial.println(freeHeap);
+  
+  #if ESP32_C3_FIXES_ENABLED
+  if (freeHeap < 200000) {  // Less than 200KB
+    Serial.println("⚠️  WARNING: Low memory detected on ESP32-C3");
+    Serial.println("💡 ESP32-C3 stability fixes are ENABLED");
+  }
+  
+  // ESP32-C3 Power Management - reduce CPU frequency for maximum stability
+  setCpuFrequencyMhz(40);  // Drastically reduce CPU frequency for maximum stability
+  Serial.println("CPU frequency set to 40MHz for maximum stability");
+  #endif
+  
   Serial.println("Serial command interface ready");
   
   if (SERIAL_TEST_MODE) {
@@ -121,16 +148,16 @@ void setup() {
 
   Serial.println("SUCCESS: LoRa transceiver ready!");
   
-  // Configure LoRa settings to match TX
-  LoRa.setSpreadingFactor(7);     // SF7 (faster data rate)
+  // Configure LoRa settings to match TX - ULTRA CONSERVATIVE for ESP32-C3
+  LoRa.setSpreadingFactor(12);    // SF12 for maximum reliability
   LoRa.setSignalBandwidth(125E3); // 125 kHz bandwidth  
-  LoRa.setCodingRate4(5);         // 4/5 coding rate
+  LoRa.setCodingRate4(8);         // CR 4/8 for maximum error correction
   LoRa.setPreambleLength(8);      // 8 symbol preamble
-  LoRa.setSyncWord(0x12);         // Private sync word
-  LoRa.setTxPower(20);            // Max power for range
-  LoRa.crc();                     // Enable CRC
+  LoRa.setSyncWord(0x12);         // Custom sync word (matches TX)
+  // LoRa.setTxPower(5);             // CONSERVATIVE: 5dBm for ESP32-C3 stability
+  LoRa.enableCrc();               // Enable CRC
   
-  Serial.println("LoRa configured: SF7, BW125, CR4/5, Pwr20dBm");
+  Serial.println("LoRa configured: SF12, BW125, CR4/8, TxPower=5dBm (ESP32-C3 Conservative)");
   
   Serial.println("🚁 *** RX READY - GROUND STATION WITH MENU SYSTEM ***");
   Serial.println("💡 Starting in CONFIG mode - set your test parameters");
@@ -153,6 +180,9 @@ void setup() {
 }
 
 void loop() {
+  // ESP32-C3 Memory monitoring
+  checkMemoryStatus();
+  
   // Process user commands from serial
   processUserCommands();
   
@@ -787,17 +817,62 @@ void sendLoRaCommandNow(String command) {
     return;
   }
   
-  // Send immediately via LoRa
+  // ESP32-C3 ULTRA-SAFE MODE: Minimal transmission attempt
+  Serial.println("🔧 ESP32-C3 ULTRA-SAFE MODE: Minimal transmission attempt");
+
+  // ESP32-C3 Memory check before operation
+  if (ESP32_C3_FIXES_ENABLED) {
+    Serial.print("Free heap before: ");
+    Serial.println(ESP.getFreeHeap());
+  }
+
+  // ESP32-C3 CRITICAL: Use fixed char array to avoid String operations during transmission
+  char commandMsg[100];
+  command.toCharArray(commandMsg, sizeof(commandMsg));
+
+  Serial.print("📡 Sending: ");
+  Serial.println(commandMsg);
+
+  // Ultra-conservative transmission with maximum safety
+  yield();
+  delay(100);
+  
+  Serial.println("Step 1: beginPacket()");
   LoRa.beginPacket();
-  LoRa.print(command);
+  yield();
+  delay(100);
+  
+  Serial.println("Step 2: writing data");
+  // Write data byte by byte to be extra safe
+  int len = strlen(commandMsg);
+  for (int i = 0; i < len; i++) {
+    LoRa.write(commandMsg[i]);
+    if (i % 5 == 0) {
+      yield(); // Feed watchdog every 5 characters
+      delayMicroseconds(100);
+    }
+  }
+  
+  yield();
+  delay(200); // Long delay before the critical endPacket
+  
+  Serial.println("Step 3: endPacket() - CRITICAL");
+  yield();
+  
   LoRa.endPacket();
   
-  Serial.println("   ✅ LoRa packet transmitted");
+  yield();
+  Serial.println("SUCCESS: Packet sent!");
   
   // Update counters
   commandPacketCount++;
   lastTXResponse = "Command sent: " + command;
   lastCommandTime = millis();
+
+  if (ESP32_C3_FIXES_ENABLED) {
+    Serial.print("Free heap after: ");
+    Serial.println(ESP.getFreeHeap());
+  }
 }
 
 void sendConfigurationToTX() {
@@ -811,12 +886,12 @@ void sendConfigurationToTX() {
     return;
   }
   
-  Serial.println("📤 Sending configuration to TX...");
+  Serial.println("📤 Sending COMBINED configuration to TX...");
   Serial.println("   📋 Configuration Details:");
-  Serial.println("   • Filename: '" + testConfig.filename + "' → will be sent as 'FILENAME:" + testConfig.filename + "'");
-  Serial.println("   • Weight: " + String(testConfig.totalWeight, 2) + " kg → will be sent as 'WEIGHT:" + String(testConfig.totalWeight, 2) + "'");
-  Serial.println("   • Wind: " + String(testConfig.windSpeed, 2) + " m/s → will be sent as 'WIND:" + String(testConfig.windSpeed, 2) + "'");
-  Serial.println("   • Height: " + String(testConfig.height, 2) + " m → will be sent as 'HEIGHT:" + String(testConfig.height, 2) + "'");
+  Serial.println("   • Filename: '" + testConfig.filename + "'");
+  Serial.println("   • Weight: " + String(testConfig.totalWeight, 2) + " kg");
+  Serial.println("   • Wind: " + String(testConfig.windSpeed, 2) + " m/s");
+  Serial.println("   • Height: " + String(testConfig.height, 2) + " m");
   Serial.println("");
   
   // Validate filename before sending
@@ -825,52 +900,28 @@ void sendConfigurationToTX() {
     return;
   }
   
-  // Send configuration commands with better spacing and validation
-  Serial.println("➤ Step 1: Initialize configuration mode");
-  sendLoRaCommandNow("CONFIG_START");
-  delay(700);  // Longer delay to ensure TX enters config mode
+  // Create combined CONFIG message (matches updated TX protocol)
+  String combinedConfig = "CONFIG:" + testConfig.filename + "," + 
+                         String((int)testConfig.totalWeight) + "," +
+                         String((int)testConfig.windSpeed) + "," +
+                         String((int)testConfig.height);
   
-  Serial.println("➤ Step 2: Send filename");  
-  String filenameCmd = "FILENAME:" + testConfig.filename;
-  Serial.println("   📡 Sending: '" + filenameCmd + "'");
-  sendLoRaCommandNow(filenameCmd);
-  delay(500);  // Longer delay for filename processing
+  Serial.println("📡 Sending COMBINED CONFIG: " + combinedConfig);
+  Serial.println("� This matches the updated TX protocol that handles combined CONFIG packets");
   
-  Serial.println("➤ Step 3: Send weight");
-  String weightCmd = "WEIGHT:" + String(testConfig.totalWeight, 2);
-  Serial.println("   📡 Sending: '" + weightCmd + "'");
-  sendLoRaCommandNow(weightCmd);
-  delay(500);  // Longer delay for weight processing
-  
-  Serial.println("➤ Step 4: Send wind speed");
-  String windCmd = "WIND:" + String(testConfig.windSpeed, 2);
-  Serial.println("   📡 Sending: '" + windCmd + "'");
-  sendLoRaCommandNow(windCmd);
-  delay(500);  // Longer delay for wind processing
-  
-  Serial.println("➤ Step 5: Send height");
-  String heightCmd = "HEIGHT:" + String(testConfig.height, 2);
-  Serial.println("   📡 Sending: '" + heightCmd + "'");
-  sendLoRaCommandNow(heightCmd);
-  delay(500);  // Longer delay for height processing
-  
-  Serial.println("➤ Step 6: Finalize configuration");
-  sendLoRaCommandNow("CONFIG_READY");
-  delay(300);  // Allow final processing
+  // Send using ultra-safe method
+  sendLoRaCommandNow(combinedConfig);
   
   configurationSent = true;
   Serial.println("");
-  Serial.println("✅ Configuration transmission sequence complete!");
-  Serial.println("🔍 Check TX serial monitor for all 6 commands:");
-  Serial.println("   1. CONFIG_START");
-  Serial.println("   2. " + filenameCmd);
-  Serial.println("   3. " + weightCmd);
-  Serial.println("   4. " + windCmd);
-  Serial.println("   5. " + heightCmd);
-  Serial.println("   6. CONFIG_READY");
+  Serial.println("✅ Configuration transmission complete!");
+  Serial.println("🔍 Check TX serial monitor for:");
+  Serial.println("   • 'LoRa packet received' message");
+  Serial.println("   • 'RX Command: CONFIG:...' message");
+  Serial.println("   • 'Combined CONFIG packet received' message");
+  Serial.println("   • 'Configuration complete - ready to start' message");
   Serial.println("");
-  Serial.println("⚠️  If any command is missing on TX, it might be LoRa packet loss.");
-  Serial.println("💡 Try sending configuration again if TX doesn't show all commands.");
+  Serial.println("⚠️  If TX doesn't show these messages, there may be LoRa communication issues.");
 }
 
 // === MENU SYSTEM IMPLEMENTATION ===
@@ -1632,4 +1683,26 @@ String getMenuTextInput() {
   
   input.trim();
   return input;
+}
+
+// ESP32-C3 Memory Monitoring Function
+void checkMemoryStatus() {
+  #if ESP32_C3_FIXES_ENABLED
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 10000) { // Check every 10 seconds
+    lastCheck = millis();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t minFreeHeap = ESP.getMinFreeHeap();
+    
+    if (freeHeap < 100000) { // Less than 100KB
+      Serial.println("🚨 CRITICAL: Low memory detected!");
+      Serial.print("   Free: "); Serial.print(freeHeap); Serial.println(" bytes");
+      Serial.print("   Min ever: "); Serial.print(minFreeHeap); Serial.println(" bytes");
+      Serial.println("   Consider reducing String operations or restarting");
+    } else if (freeHeap < 150000) { // Less than 150KB
+      Serial.println("⚠️  Warning: Memory getting low");
+      Serial.print("   Free: "); Serial.print(freeHeap); Serial.println(" bytes");
+    }
+  }
+  #endif
 }

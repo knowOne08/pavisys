@@ -3,12 +3,67 @@
 #include <Wire.h>
 #include <MS5611.h>  
 #include <MPU6050.h>
-#include <HX711.h>
+#include "HX711_Raw.h"  // Custom raw HX711 implementation (no internal filtering)
 #include "FS.h"
 #include "LittleFS.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+
+
+// === FLIGHT COMPUTER CONFIGURATION ===
+// Change this single macro to switch between two FC builds
+#define FC_NO 2  // 1 = FC1 (20Hz, "PaviFlightData"), 2 = FC2 (40Hz, "PaviFlightData-2")
+
+// Auto-configure based on FC number
+#if FC_NO == 1
+  #define DATA_RATE_MODE 2        // 20Hz for FC1
+  #define WIFI_SSID "PaviFlightData"
+#elif FC_NO == 2  
+  #define DATA_RATE_MODE 4        // 40Hz for FC2
+  #define WIFI_SSID "PaviFlightData-2"
+#else
+  #error "Invalid FC_NO! Please set FC_NO to 1 or 2"
+#endif
+
+/*
+ * TO SWITCH BETWEEN FLIGHT COMPUTERS:
+ * 1. Change FC_NO to 1 or 2
+ * 2. That's it! The system automatically configures:
+ *    - FC1: 20Hz data rate + "PaviFlightData" WiFi SSID
+ *    - FC2: 40Hz data rate + "PaviFlightData-2" WiFi SSID
+ */
+
+// === SENSOR FILTERING CONFIGURATION ===
+// Set to false for RAW mode (no filtering), true for SMOOTH mode (with filtering)
+#define ENABLE_SENSOR_FILTERING false  // Change this to toggle ALL sensor filtering
+
+// Individual sensor filtering overrides (only used if ENABLE_SENSOR_FILTERING is true)
+#define ENABLE_PRESSURE_FILTERING true   // Barometer smoothing (heavy filtering)
+#define ENABLE_ACCEL_FILTERING true      // Accelerometer smoothing (medium filtering) 
+#define ENABLE_GYRO_FILTERING true       // Gyroscope smoothing (light filtering)
+#define ENABLE_LOADCELL_FILTERING false  // Load cell is always raw (HX711_Raw library)
+
+/*
+ * FILTERING MODES:
+ * 
+ * RAW MODE (ENABLE_SENSOR_FILTERING = false):
+ * - All sensors provide direct, unfiltered readings
+ * - Maximum responsiveness and sensitivity
+ * - Best for flight data analysis and research
+ * - May be noisier but shows true sensor behavior
+ * 
+ * SMOOTH MODE (ENABLE_SENSOR_FILTERING = true):
+ * - Sensors use moving average and exponential filtering
+ * - Smoother data for display and basic flight control
+ * - Better for real-time monitoring during flight
+ * - Some delay but cleaner readings
+ * 
+ * MIXED MODE:
+ * - Set ENABLE_SENSOR_FILTERING = true
+ * - Then adjust individual sensor filtering flags above
+ * - Customize which sensors are filtered
+ */
 
 // LoRa pin mapping
 #define NSS   5
@@ -33,9 +88,6 @@
 
 // Test mode for pyro channels - set to true to test LEDs
 #define PYRO_TEST_MODE false
-
-// SIMPLE RATE SELECTION - Choose your data rate
-#define DATA_RATE_MODE 4  // 1=10Hz, 2=20Hz, 3=30Hz, 4=40Hz
 
 // LORA TRANSMISSION CONTROL - TX is now pure command responder
 #define LORA_TRANSMISSION_MODE 0   // TX never sends unsolicited telemetry
@@ -116,7 +168,8 @@ int currentSubMenu = 0;
 #define MENU_CALIBRATION 4
 
 // === WIFI SOFTAP CONFIGURATION ===
-#define WIFI_SSID "PaviFlightData"
+// SSID is auto-configured based on FC_NO above
+
 #define WIFI_PASSWORD ""
 #define WIFI_CHANNEL 6
 #define MAX_CONNECTIONS 4
@@ -151,7 +204,7 @@ int gyroIndex = 0;
 // Sensor objects
 MS5611 baro;
 MPU6050 mpu;
-HX711 loadCell;
+HX711_Raw loadCell;  // Using raw implementation (no internal filtering)
 bool baroReady = false;
 bool mpuReady = false;
 bool loadCellReady = false;
@@ -229,6 +282,7 @@ bool isLoadCellCalibrating();
 void calibrateLoadCellZero();
 void calibrateLoadCellWeight(float weight);
 void saveLoadCellCalibration();
+void loadCalibrationFromFile();
 void testLoadCellCalibration();
 
 // Flight Data functions
@@ -257,13 +311,32 @@ void setup() {
 
   Serial.println("=== TX: LoRa Command Responder ===");
   Serial.println("Pure command responder - no unsolicited telemetry");
-  Serial.println("Sensors: MS5611 + MPU6050 + HX711 + 4x Pyro Channels");
+  Serial.println("Sensors: MS5611 + MPU6050 + HX711_Raw + 4x Pyro Channels");
   Serial.print("Barometer: "); Serial.println(ENABLE_BAROMETER ? "ON" : "OFF");
   Serial.print("Accelerometer: "); Serial.println(ENABLE_ACCELEROMETER ? "ON" : "OFF");
   Serial.print("Gyroscope: "); Serial.println(ENABLE_GYROSCOPE ? "ON" : "OFF");
   Serial.print("Temperature: "); Serial.println(ENABLE_TEMPERATURE ? "ON" : "OFF");
-  Serial.print("Load Cell: "); Serial.println(ENABLE_LOAD_CELL ? "ON" : "OFF");
+  Serial.print("Load Cell: "); Serial.println(ENABLE_LOAD_CELL ? "ON (RAW MODE)" : "OFF");
   Serial.print("Pyro Test Mode: "); Serial.println(PYRO_TEST_MODE ? "ON" : "OFF");
+  
+  // Display filtering status
+  Serial.println("");
+  Serial.println("=== SENSOR FILTERING STATUS ===");
+  if (ENABLE_SENSOR_FILTERING) {
+    Serial.println("📊 FILTERING MODE: SMOOTH (filtered data)");
+    Serial.print("  • Pressure filtering: "); Serial.println(ENABLE_PRESSURE_FILTERING ? "ON" : "OFF");
+    Serial.print("  • Accelerometer filtering: "); Serial.println(ENABLE_ACCEL_FILTERING ? "ON" : "OFF");
+    Serial.print("  • Gyroscope filtering: "); Serial.println(ENABLE_GYRO_FILTERING ? "ON" : "OFF");
+    Serial.print("  • Load cell filtering: ALWAYS OFF (HX711_Raw)");
+  } else {
+    Serial.println("🎯 FILTERING MODE: RAW (unfiltered data)");
+    Serial.println("  • All sensors provide direct, unfiltered readings");
+    Serial.println("  • Maximum responsiveness and sensitivity");
+    Serial.println("  • Best for flight data analysis and research");
+  }
+  Serial.println("💡 Change ENABLE_SENSOR_FILTERING to toggle modes");
+  Serial.println("=======================================");
+  Serial.println("");
   
   if (SERIAL_TEST_MODE) {
     Serial.println("RUNNING IN SERIAL TEST MODE");
@@ -406,15 +479,15 @@ void setup() {
     }
   }
 
-  // Initialize HX711 Load Cell
+  // Initialize HX711 Load Cell (RAW - No Internal Filtering)
   if (ENABLE_LOAD_CELL) {
-    Serial.println("Initializing HX711 Load Cell...");
+    Serial.println("Initializing HX711 Load Cell (RAW MODE - No Internal Filtering)...");
     loadCell.begin(HX711_DOUT, HX711_SCK);
     
     if (loadCell.is_ready()) {
-      Serial.println("HX711 ready");
+      Serial.println("HX711 ready (RAW mode for maximum responsiveness)");
       
-      // Set calibration factor
+      // Set initial calibration factor (default)
       loadCell.set_scale(loadCellCalibrationFactor);
       
       // Tare the scale (set current reading as zero)
@@ -425,7 +498,12 @@ void setup() {
       
       Serial.print("Load cell tared. Offset: ");
       Serial.println(loadCellOffset);
+      Serial.println("📈 RAW MODE: No internal smoothing - you get direct HX711 readings!");
       loadCellReady = true;
+      
+      // Try to load saved calibration
+      Serial.println("🔍 Checking for saved calibration...");
+      loadCalibrationFromFile();
     } else {
       Serial.println("HX711 not detected!");
       loadCellReady = false;
@@ -602,8 +680,13 @@ void loop() {
 
 // Removed unused readSensorsOptimized() function - using readSensorsWithSmartLoadCell() instead
 
-// Helper functions for smooth filtering
+// Helper functions for conditional filtering
 float filterPressure(float newReading) {
+  // Check if pressure filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_PRESSURE_FILTERING) {
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   static bool initialized = false;
   static float exponentialAverage = 0;
@@ -637,6 +720,11 @@ float filterPressure(float newReading) {
 }
 
 float filterAccelX(float newReading) {
+  // Check if acceleration filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_ACCEL_FILTERING) {
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   static float exponentialAverage = 0;
   static bool initialized = false;
@@ -659,6 +747,11 @@ float filterAccelX(float newReading) {
 }
 
 float filterAccelY(float newReading) {
+  // Check if acceleration filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_ACCEL_FILTERING) {
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   static float exponentialAverage = 0;
   static bool initialized = false;
@@ -680,6 +773,12 @@ float filterAccelY(float newReading) {
 }
 
 float filterAccelZ(float newReading) {
+  // Check if acceleration filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_ACCEL_FILTERING) {
+    accelIndex = (accelIndex + 1) % ACCEL_FILTER_SIZE; // Still update index for consistency
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   static float exponentialAverage = 0;
   static bool initialized = false;
@@ -702,6 +801,11 @@ float filterAccelZ(float newReading) {
 }
 
 float filterGyroX(float newReading) {
+  // Check if gyroscope filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_GYRO_FILTERING) {
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   
   total = total - gyroXReadings[gyroIndex];
@@ -712,6 +816,11 @@ float filterGyroX(float newReading) {
 }
 
 float filterGyroY(float newReading) {
+  // Check if gyroscope filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_GYRO_FILTERING) {
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   
   total = total - gyroYReadings[gyroIndex];
@@ -722,6 +831,12 @@ float filterGyroY(float newReading) {
 }
 
 float filterGyroZ(float newReading) {
+  // Check if gyroscope filtering is enabled
+  if (!ENABLE_SENSOR_FILTERING || !ENABLE_GYRO_FILTERING) {
+    gyroIndex = (gyroIndex + 1) % GYRO_FILTER_SIZE; // Still update index for consistency
+    return newReading;  // Return raw reading without any filtering
+  }
+  
   static float total = 0;
   
   total = total - gyroZReadings[gyroIndex];
@@ -939,8 +1054,9 @@ void readSensorsWithSmartLoadCell() {
         
         // Only read if HX711 is actually ready (non-blocking check)
         if (loadCell.is_ready()) {
+          // RAW MODE: Single reading, no averaging for maximum responsiveness
           loadCellRaw = loadCell.read();
-          loadCellWeight = loadCell.get_units();
+          loadCellWeight = loadCell.get_units(1);  // Single reading, no averaging
         }
         // If not ready, we just skip this cycle and use the previous value
       }
@@ -1017,13 +1133,15 @@ void showCalibrationMenu() {
   Serial.println("║       CALIBRATION & TESTING          ║");
   Serial.println("╠══════════════════════════════════════╣");
   Serial.println("║  1. Test Load Cell Reading           ║");
-  Serial.println("║  2. Zero Load Cell (Tare)           ║");
-  Serial.println("║  3. Test All Pyro Channels          ║");
-  Serial.println("║  4. Test LoRa Communication         ║");
-  Serial.println("║  5. Run Sensor Diagnostics          ║");
-  Serial.println("║  9. Back to Main Menu                ║");
+  Serial.println("║  2. Zero Load Cell (Tare)            ║");
+  Serial.println("║  3. Full Load Cell Calibration       ║");
+  Serial.println("║  4. Save Calibration to File         ║");
+  Serial.println("║  5. Test All Pyro Channels           ║");
+  Serial.println("║  6. Test LoRa Communication          ║");
+  Serial.println("║  7. Run Sensor Diagnostics           ║");
+  Serial.println("║  0. Back to Main Menu                 ║");
   Serial.println("╚══════════════════════════════════════╝");
-  Serial.print("⚖️ Select calibration option (1-5, 9): ");
+  Serial.print("⚖️ Select calibration option (0-7): ");
 }
 
 void processMenuInput(String input) {
@@ -1202,27 +1320,40 @@ void processMenuInput(String input) {
         calibrateLoadCellZero();
         break;
       case 3:
-        Serial.println("💡 Testing pyro channels...");
+        Serial.println("⚖️ Starting full load cell calibration...");
+        Serial.println("📋 Step-by-step calibration process:");
+        Serial.println("   1. First zero the load cell (if not done already)");
+        Serial.println("   2. Then provide a known weight for calibration");
+        Serial.println("");
+        Serial.print("🎯 Enter known weight in kg (e.g. 1.5): ");
+        currentSubMenu = 3;  // Set submenu mode for weight input
+        return;
+      case 4:
+        Serial.println("� Saving calibration to file...");
+        saveLoadCellCalibration();
+        break;
+      case 5:
+        Serial.println("�💡 Testing pyro channels...");
         if (PYRO_TEST_MODE) {
           runPyroTest();
         } else {
           Serial.println("⚠️ Pyro test mode is disabled. Set PYRO_TEST_MODE to true to enable.");
         }
         break;
-      case 4:
+      case 6:
         Serial.println("📡 Testing LoRa communication...");
         Serial.println("Send 'PING' command from RX to test...");
         break;
-      case 5:
+      case 7:
         Serial.println("🔍 Running sensor diagnostics...");
         runSensorDiagnostics();
         break;
-      case 9:
+      case 0:
         currentMenu = MENU_MAIN;
         showMainMenu();
         return;
       default:
-        Serial.println("❌ Invalid option! Please select 1-5 or 9");
+        Serial.println("❌ Invalid option! Please select 0-7");
         break;
     }
     delay(2000);
@@ -1258,16 +1389,31 @@ void runSensorDiagnostics() {
   Serial.println("\n=== SENSOR DIAGNOSTICS ===");
   Serial.print("Barometer MS5611: "); Serial.println(baroReady ? "✅ OK" : "❌ FAIL");
   Serial.print("IMU MPU6050: "); Serial.println(mpuReady ? "✅ OK" : "❌ FAIL");
-  Serial.print("Load Cell HX711: "); Serial.println(loadCellReady ? "✅ OK" : "❌ FAIL");
+  Serial.print("Load Cell HX711_Raw: "); Serial.println(loadCellReady ? "✅ OK (RAW MODE)" : "❌ FAIL");
   Serial.print("Filesystem: "); Serial.println(filesystemReady ? "✅ OK" : "❌ FAIL");
   
+  // Show filtering status
+  Serial.println("\n--- Filtering Status ---");
+  if (ENABLE_SENSOR_FILTERING) {
+    Serial.println("📊 Mode: SMOOTH (filtered data)");
+    Serial.print("  • Pressure: "); Serial.println(ENABLE_PRESSURE_FILTERING ? "FILTERED" : "RAW");
+    Serial.print("  • Accelerometer: "); Serial.println(ENABLE_ACCEL_FILTERING ? "FILTERED" : "RAW");
+    Serial.print("  • Gyroscope: "); Serial.println(ENABLE_GYRO_FILTERING ? "FILTERED" : "RAW");
+  } else {
+    Serial.println("🎯 Mode: RAW (all sensors unfiltered)");
+  }
+  Serial.println("  • Load Cell: ALWAYS RAW (HX711_Raw library)");
+  
   if (baroReady) {
+    Serial.println("\n--- Current Readings ---");
     Serial.print("Current pressure: "); Serial.print(pressure, 2); Serial.println(" hPa");
     Serial.print("Current altitude: "); Serial.print(altitude, 2); Serial.println(" m");
   }
   
   if (loadCellReady && loadCell.is_ready()) {
-    Serial.print("Load cell reading: "); Serial.print(loadCellWeight, 3); Serial.println(" kg");
+    Serial.print("Load cell reading (raw): "); Serial.print(loadCellWeight, 3); Serial.println(" kg");
+    Serial.print("Load cell raw value: "); Serial.println(loadCellRaw);
+    Serial.println("📈 Using RAW HX711 - no internal filtering for maximum responsiveness");
   }
   
   Serial.println("========================");
@@ -1362,6 +1508,27 @@ void createDataFile() {
     Serial.print("IMU: "); Serial.println(mpuReady ? "Ready" : "Not ready");  
     Serial.print("Load Cell: "); Serial.println(loadCellReady ? "Ready" : "Not ready");
     
+    // Load Cell Calibration Status
+    if (loadCellReady) {
+      Serial.println("\n--- Load Cell Calibration ---");
+      Serial.print("Calibration Factor: "); Serial.println(loadCellCalibrationFactor, 6);
+      Serial.print("Zero Offset: "); Serial.println(loadCellOffset);
+      
+      // Check if calibration file exists
+      if (filesystemReady && LittleFS.exists("/loadcell_cal.txt")) {
+        Serial.println("Saved Calibration: ✅ Available");
+      } else {
+        Serial.println("Saved Calibration: ❌ Not found");
+      }
+      
+      // Show calibration mode if active
+      if (isLoadCellCalibrating()) {
+        Serial.println("Calibration Mode: 🔧 ACTIVE");
+      } else {
+        Serial.println("Calibration Mode: 💤 Inactive");
+      }
+    }
+    
     if (flightState >= FLIGHT_CONFIGURED) {
       Serial.println("\n--- Flight Configuration ---");
       Serial.print("Filename: "); Serial.println(flightConfig.filename);
@@ -1387,6 +1554,13 @@ void createDataFile() {
     Serial.println("START - Start data recording");
     Serial.println("STOP - Stop data recording");
     Serial.println("PYRO1, PYRO2, PYRO3, PYRO4 - Fire pyro channels");
+    Serial.println("");
+    Serial.println("Load Cell Calibration Commands:");
+    Serial.println("CALIB_START - Start calibration process");
+    Serial.println("CALIB_ZERO - Zero the load cell (tare)");
+    Serial.println("CALIB_WEIGHT:1.5 - Calibrate with known weight (kg)");
+    Serial.println("CALIB_SAVE - Save calibration to file");
+    Serial.println("CALIB_TEST - Test current calibration");
     Serial.println("");
     Serial.println("💡 EASY ACCESS - Interactive Menu System:");
     Serial.println("MENU or M - Open interactive menu system");
@@ -1423,7 +1597,22 @@ void createDataFile() {
               currentSubMenu = 0;
               delay(2000);
               showFileMenu();
-            } else {
+            }
+            // Handle calibration weight input
+            else if (currentMenu == MENU_CALIBRATION && currentSubMenu == 3) {
+              float weight = commandBuffer.toFloat();
+              if (weight > 0) {
+                Serial.print("⚖️ Starting weight calibration with "); 
+                Serial.print(weight, 2); Serial.println(" kg");
+                calibrateLoadCellWeight(weight);
+              } else {
+                Serial.println("❌ Invalid weight entered");
+              }
+              currentSubMenu = 0;
+              delay(3000);  // Give more time to read calibration results
+              showCalibrationMenu();
+            }
+            else {
               processMenuInput(commandBuffer);
             }
           }
@@ -2794,67 +2983,384 @@ void handleWiFiClients() {
 }
 
 // === LOAD CELL CALIBRATION FUNCTIONS ===
+// Calibration state variables
+static bool calibrationMode = false;
+static bool zeroCalibrated = false;
+static bool weightCalibrated = false;
+static float calibrationKnownWeight = 0.0;
+static long rawZeroReading = 0;
+static long rawWeightReading = 0;
+
 void startLoadCellCalibration() {
-  Serial.println("⚖️ Load cell calibration started");
-  Serial.println("   Place no weight on the load cell and send 'cal zero'");
-  // Implementation for starting calibration
+  Serial.println("\n⚖️ === LOAD CELL CALIBRATION STARTED ===");
+  Serial.println("📋 Calibration Process:");
+  Serial.println("   1. First, calibrate ZERO (no weight)");
+  Serial.println("   2. Then, calibrate with known weight");
+  Serial.println("   3. System will calculate calibration factor");
+  Serial.println("");
+  Serial.println("💡 Use menu system or commands:");
+  Serial.println("   • MENU → 4 → 2 (Zero calibration)");
+  Serial.println("   • CAL_WEIGHT:<weight> (Weight calibration)");
+  Serial.println("   • CAL_SAVE (Save calibration)");
+  
+  calibrationMode = true;
+  zeroCalibrated = false;
+  weightCalibrated = false;
+  calibrationKnownWeight = 0.0;
+  
+  Serial.println("✅ Calibration mode activated");
 }
 
 void stopLoadCellCalibration() {
-  Serial.println("⚖️ Load cell calibration stopped");
-  // Implementation for stopping calibration
+  Serial.println("\n⚖️ === LOAD CELL CALIBRATION STOPPED ===");
+  if (zeroCalibrated && weightCalibrated) {
+    Serial.println("✅ Calibration completed successfully");
+    Serial.print("📊 Final calibration factor: ");
+    Serial.println(loadCellCalibrationFactor, 2);
+  } else {
+    Serial.println("⚠️ Calibration incomplete:");
+    Serial.print("   Zero calibrated: "); Serial.println(zeroCalibrated ? "✅" : "❌");
+    Serial.print("   Weight calibrated: "); Serial.println(weightCalibrated ? "✅" : "❌");
+  }
+  
+  calibrationMode = false;
+  Serial.println("==========================================");
 }
 
 bool isLoadCellCalibrating() {
-  // Return true if calibration is in progress
-  return false;
+  return calibrationMode;
 }
 
 void calibrateLoadCellZero() {
-  Serial.println("⚖️ Calibrating load cell zero point");
-  if (loadCellReady) {
-    loadCell.tare();
-    Serial.println("   ✅ Zero point calibrated");
-  } else {
-    Serial.println("   ❌ Load cell not ready");
+  Serial.println("\n🎯 === ZERO POINT CALIBRATION ===");
+  
+  if (!loadCellReady) {
+    Serial.println("❌ ERROR: Load cell not ready");
+    return;
   }
+  
+  Serial.println("📋 Instructions:");
+  Serial.println("   1. Remove ALL weight from load cell");
+  Serial.println("   2. Ensure load cell is not touching anything");
+  Serial.println("   3. Wait for stable readings...");
+  Serial.println("");
+  
+  // Wait for stable readings
+  Serial.println("⏳ Stabilizing... (5 seconds)");
+  delay(5000);
+  
+  if (!loadCell.is_ready()) {
+    Serial.println("❌ ERROR: Load cell not responding");
+    return;
+  }
+  
+  // Take multiple readings for accuracy
+  Serial.println("📊 Taking zero readings...");
+  long totalReading = 0;
+  int validReadings = 0;
+  
+  for (int i = 0; i < 20; i++) {
+    if (loadCell.is_ready()) {
+      long reading = loadCell.read();
+      if (reading != 0) {  // Skip failed readings
+        totalReading += reading;
+        validReadings++;
+        Serial.print("  Reading "); Serial.print(i + 1); 
+        Serial.print(": "); Serial.println(reading);
+      }
+      delay(100);
+    }
+  }
+  
+  if (validReadings < 10) {
+    Serial.println("❌ ERROR: Not enough valid readings");
+    return;
+  }
+  
+  // Calculate average zero point
+  rawZeroReading = totalReading / validReadings;
+  loadCell.set_offset(rawZeroReading);
+  loadCellOffset = rawZeroReading;
+  
+  zeroCalibrated = true;
+  
+  Serial.println("✅ ZERO CALIBRATION COMPLETE");
+  Serial.print("📊 Average zero reading: "); Serial.println(rawZeroReading);
+  Serial.print("📊 Valid samples: "); Serial.print(validReadings); Serial.println("/20");
+  Serial.println("🎯 Load cell zeroed successfully!");
+  
+  // Test the zero
+  delay(1000);
+  if (loadCell.is_ready()) {
+    float testWeight = loadCell.get_units(5);
+    Serial.print("🧪 Zero test reading: "); 
+    Serial.print(testWeight, 4); Serial.println(" kg");
+    
+    if (abs(testWeight) < 0.01) {
+      Serial.println("✅ Zero calibration verified");
+    } else {
+      Serial.println("⚠️ Zero reading not perfect, but acceptable");
+    }
+  }
+  
+  Serial.println("================================");
 }
 
 void calibrateLoadCellWeight(float weight) {
-  Serial.print("⚖️ Calibrating with known weight: ");
-  Serial.print(weight, 2);
-  Serial.println(" kg");
+  Serial.println("\n⚖️ === WEIGHT CALIBRATION ===");
   
-  if (loadCellReady && weight > 0) {
-    // Get raw reading
-    long reading = loadCell.get_value(10);
-    
-    // Calculate calibration factor
-    loadCellCalibrationFactor = reading / weight;
-    loadCell.set_scale(loadCellCalibrationFactor);
-    
-    Serial.print("   ✅ Calibration factor: ");
-    Serial.println(loadCellCalibrationFactor, 2);
-  } else {
-    Serial.println("   ❌ Invalid weight or load cell not ready");
+  if (!loadCellReady) {
+    Serial.println("❌ ERROR: Load cell not ready");
+    return;
   }
+  
+  if (!zeroCalibrated) {
+    Serial.println("❌ ERROR: Must calibrate zero point first!");
+    Serial.println("💡 Use: MENU → 4 → 2 (Zero Load Cell)");
+    return;
+  }
+  
+  if (weight <= 0) {
+    Serial.println("❌ ERROR: Weight must be positive");
+    return;
+  }
+  
+  calibrationKnownWeight = weight;
+  
+  Serial.print("📋 Instructions for "); Serial.print(weight, 2); Serial.println(" kg calibration:");
+  Serial.println("   1. Place EXACTLY the known weight on load cell");
+  Serial.println("   2. Ensure weight is centered and stable");
+  Serial.println("   3. Wait for stable readings...");
+  Serial.println("");
+  
+  // Wait for weight to be placed and stabilized
+  Serial.println("⏳ Stabilizing... (10 seconds)");
+  Serial.println("   (Time to place weight and let it settle)");
+  delay(10000);
+  
+  if (!loadCell.is_ready()) {
+    Serial.println("❌ ERROR: Load cell not responding");
+    return;
+  }
+  
+  // Take multiple readings for accuracy
+  Serial.println("📊 Taking weight readings...");
+  long totalReading = 0;
+  int validReadings = 0;
+  
+  for (int i = 0; i < 20; i++) {
+    if (loadCell.is_ready()) {
+      long reading = loadCell.get_value(1);  // Raw reading minus offset
+      if (reading != 0) {  // Skip failed readings
+        totalReading += reading;
+        validReadings++;
+        Serial.print("  Reading "); Serial.print(i + 1); 
+        Serial.print(": "); Serial.println(reading);
+      }
+      delay(200);
+    }
+  }
+  
+  if (validReadings < 10) {
+    Serial.println("❌ ERROR: Not enough valid readings");
+    return;
+  }
+  
+  // Calculate average weight reading and calibration factor
+  rawWeightReading = totalReading / validReadings;
+  
+  if (rawWeightReading == 0) {
+    Serial.println("❌ ERROR: No weight detected");
+    Serial.println("💡 Check that weight is properly placed");
+    return;
+  }
+  
+  // Calculate calibration factor: raw_reading / actual_weight
+  float newCalibrationFactor = (float)rawWeightReading / weight;
+  
+  // Update calibration
+  loadCellCalibrationFactor = newCalibrationFactor;
+  loadCell.set_scale(loadCellCalibrationFactor);
+  
+  weightCalibrated = true;
+  
+  Serial.println("✅ WEIGHT CALIBRATION COMPLETE");
+  Serial.print("📊 Known weight: "); Serial.print(weight, 2); Serial.println(" kg");
+  Serial.print("📊 Average raw reading: "); Serial.println(rawWeightReading);
+  Serial.print("📊 Calculated factor: "); Serial.println(newCalibrationFactor, 2);
+  Serial.print("📊 Valid samples: "); Serial.print(validReadings); Serial.println("/20");
+  
+  // Test the calibration immediately
+  delay(1000);
+  if (loadCell.is_ready()) {
+    float testWeight = loadCell.get_units(5);
+    Serial.print("🧪 Calibration test: "); 
+    Serial.print(testWeight, 3); Serial.println(" kg");
+    
+    float error = abs(testWeight - weight);
+    float errorPercent = (error / weight) * 100;
+    
+    Serial.print("🎯 Error: ±"); Serial.print(error, 3); 
+    Serial.print(" kg ("); Serial.print(errorPercent, 1); Serial.println("%)");
+    
+    if (errorPercent < 5.0) {
+      Serial.println("✅ Calibration accuracy: EXCELLENT");
+    } else if (errorPercent < 10.0) {
+      Serial.println("✅ Calibration accuracy: GOOD");
+    } else {
+      Serial.println("⚠️ Calibration accuracy: FAIR (consider recalibrating)");
+    }
+  }
+  
+  Serial.println("================================");
 }
 
 void saveLoadCellCalibration() {
-  Serial.println("⚖️ Load cell calibration saved to LittleFS");
-  // Implementation for saving calibration data
+  Serial.println("\n💾 === SAVING CALIBRATION ===");
+  
+  if (!filesystemReady) {
+    Serial.println("❌ ERROR: Filesystem not ready");
+    return;
+  }
+  
+  if (!zeroCalibrated || !weightCalibrated) {
+    Serial.println("❌ ERROR: Incomplete calibration");
+    Serial.print("   Zero: "); Serial.println(zeroCalibrated ? "✅" : "❌");
+    Serial.print("   Weight: "); Serial.println(weightCalibrated ? "✅" : "❌");
+    return;
+  }
+  
+  // Create calibration file
+  File calFile = LittleFS.open("/loadcell_cal.txt", "w");
+  if (!calFile) {
+    Serial.println("❌ ERROR: Cannot create calibration file");
+    return;
+  }
+  
+  // Write calibration data
+  calFile.println("# Load Cell Calibration Data");
+  calFile.println("# Generated by PAVI Flight Computer");
+  calFile.print("# Timestamp: "); calFile.println(millis());
+  calFile.println("");
+  
+  calFile.print("calibration_factor="); calFile.println(loadCellCalibrationFactor, 6);
+  calFile.print("zero_offset="); calFile.println(loadCellOffset);
+  calFile.print("zero_raw_reading="); calFile.println(rawZeroReading);
+  calFile.print("weight_raw_reading="); calFile.println(rawWeightReading);
+  calFile.print("known_weight_kg="); calFile.println(calibrationKnownWeight, 3);
+  
+  calFile.println("");
+  calFile.println("# Usage:");
+  calFile.println("# loadCell.set_scale(calibration_factor);");
+  calFile.println("# loadCell.set_offset(zero_offset);");
+  
+  calFile.close();
+  
+  Serial.println("✅ Calibration saved successfully!");
+  Serial.println("📄 File: /loadcell_cal.txt");
+  Serial.print("📊 Calibration factor: "); Serial.println(loadCellCalibrationFactor, 6);
+  Serial.print("📊 Zero offset: "); Serial.println(loadCellOffset);
+  
+  // Also save to EEPROM-like preferences for auto-loading
+  Serial.println("💾 Calibration will be used for all future measurements");
+  Serial.println("================================");
+}
+
+void loadCalibrationFromFile() {
+  if (!filesystemReady) return;
+  
+  File calFile = LittleFS.open("/loadcell_cal.txt", "r");
+  if (!calFile) {
+    Serial.println("📄 No saved calibration found");
+    return;
+  }
+  
+  Serial.println("📄 Loading saved calibration...");
+  
+  while (calFile.available()) {
+    String line = calFile.readStringUntil('\n');
+    line.trim();
+    
+    if (line.startsWith("calibration_factor=")) {
+      String value = line.substring(19);
+      loadCellCalibrationFactor = value.toFloat();
+    } else if (line.startsWith("zero_offset=")) {
+      String value = line.substring(12);
+      loadCellOffset = (long)value.toFloat();
+    }
+  }
+  
+  calFile.close();
+  
+  // Apply loaded calibration
+  if (loadCellReady && loadCellCalibrationFactor != 0) {
+    loadCell.set_scale(loadCellCalibrationFactor);
+    loadCell.set_offset(loadCellOffset);
+    
+    Serial.println("✅ Calibration loaded and applied");
+    Serial.print("📊 Factor: "); Serial.println(loadCellCalibrationFactor, 6);
+    Serial.print("📊 Offset: "); Serial.println(loadCellOffset);
+  }
 }
 
 void testLoadCellCalibration() {
-  Serial.println("⚖️ Testing load cell calibration");
-  if (loadCellReady) {
-    float weight = loadCell.get_units(10);
-    Serial.print("   Current reading: ");
-    Serial.print(weight, 3);
-    Serial.println(" kg");
-  } else {
-    Serial.println("   ❌ Load cell not ready");
+  Serial.println("\n🧪 === LOAD CELL TEST ===");
+  
+  if (!loadCellReady) {
+    Serial.println("❌ Load cell not ready");
+    return;
   }
+  
+  if (!loadCell.is_ready()) {
+    Serial.println("❌ Load cell not responding");
+    return;
+  }
+  
+  Serial.println("📊 Current load cell status:");
+  Serial.print("   Calibration factor: "); Serial.println(loadCellCalibrationFactor, 6);
+  Serial.print("   Zero offset: "); Serial.println(loadCellOffset);
+  Serial.println("");
+  
+  // Take multiple test readings
+  Serial.println("📊 Taking 10 test readings...");
+  float totalWeight = 0;
+  int validReadings = 0;
+  
+  for (int i = 0; i < 10; i++) {
+    if (loadCell.is_ready()) {
+      long rawReading = loadCell.read();
+      float weight = loadCell.get_units(1);
+      
+      Serial.print("  "); Serial.print(i + 1); 
+      Serial.print(". Raw: "); Serial.print(rawReading);
+      Serial.print(", Weight: "); Serial.print(weight, 3); Serial.println(" kg");
+      
+      if (rawReading != 0) {
+        totalWeight += weight;
+        validReadings++;
+      }
+      delay(500);
+    }
+  }
+  
+  if (validReadings > 0) {
+    float avgWeight = totalWeight / validReadings;
+    Serial.println("");
+    Serial.print("📊 Average reading: "); Serial.print(avgWeight, 3); Serial.println(" kg");
+    Serial.print("📊 Valid samples: "); Serial.print(validReadings); Serial.println("/10");
+    
+    if (abs(avgWeight) < 0.01) {
+      Serial.println("✅ Load cell appears to be properly zeroed");
+    } else if (abs(avgWeight) < 0.1) {
+      Serial.println("⚠️ Small offset detected - consider re-zeroing");
+    } else {
+      Serial.println("❌ Significant offset - calibration may be needed");
+    }
+  } else {
+    Serial.println("❌ No valid readings obtained");
+  }
+  
+  Serial.println("========================");
 }
 
 // === END OF FILE ===
