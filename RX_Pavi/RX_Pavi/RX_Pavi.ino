@@ -112,6 +112,10 @@ void setup() {
     Serial.println("⚠️  WARNING: Low memory detected on ESP32-C3");
     Serial.println("💡 ESP32-C3 stability fixes are ENABLED");
   }
+  
+  // ESP32-C3 Power Management - reduce CPU frequency for maximum stability
+  setCpuFrequencyMhz(40);  // Drastically reduce CPU frequency for maximum stability
+  Serial.println("CPU frequency set to 40MHz for maximum stability");
   #endif
   
   Serial.println("Serial command interface ready");
@@ -144,16 +148,16 @@ void setup() {
 
   Serial.println("SUCCESS: LoRa transceiver ready!");
   
-  // Configure LoRa settings to match TX
-  LoRa.setSpreadingFactor(7);     // SF7 (faster data rate)
+  // Configure LoRa settings to match TX - ULTRA CONSERVATIVE for ESP32-C3
+  LoRa.setSpreadingFactor(12);    // SF12 for maximum reliability
   LoRa.setSignalBandwidth(125E3); // 125 kHz bandwidth  
-  LoRa.setCodingRate4(5);         // 4/5 coding rate
+  LoRa.setCodingRate4(8);         // CR 4/8 for maximum error correction
   LoRa.setPreambleLength(8);      // 8 symbol preamble
-  LoRa.setSyncWord(0x12);         // Private sync word
-  LoRa.setTxPower(20);            // Max power for range
-  LoRa.crc();                     // Enable CRC
+  LoRa.setSyncWord(0x12);         // Custom sync word (matches TX)
+  // LoRa.setTxPower(5);             // CONSERVATIVE: 5dBm for ESP32-C3 stability
+  LoRa.enableCrc();               // Enable CRC
   
-  Serial.println("LoRa configured: SF7, BW125, CR4/5, Pwr20dBm");
+  Serial.println("LoRa configured: SF12, BW125, CR4/8, TxPower=5dBm (ESP32-C3 Conservative)");
   
   Serial.println("🚁 *** RX READY - GROUND STATION WITH MENU SYSTEM ***");
   Serial.println("💡 Starting in CONFIG mode - set your test parameters");
@@ -813,31 +817,62 @@ void sendLoRaCommandNow(String command) {
     return;
   }
   
-  // ESP32-C3 Stability Fix: Add watchdog feed and memory check
-  yield(); // Feed watchdog timer
+  // ESP32-C3 ULTRA-SAFE MODE: Minimal transmission attempt
+  Serial.println("🔧 ESP32-C3 ULTRA-SAFE MODE: Minimal transmission attempt");
+
+  // ESP32-C3 Memory check before operation
+  if (ESP32_C3_FIXES_ENABLED) {
+    Serial.print("Free heap before: ");
+    Serial.println(ESP.getFreeHeap());
+  }
+
+  // ESP32-C3 CRITICAL: Use fixed char array to avoid String operations during transmission
+  char commandMsg[100];
+  command.toCharArray(commandMsg, sizeof(commandMsg));
+
+  Serial.print("📡 Sending: ");
+  Serial.println(commandMsg);
+
+  // Ultra-conservative transmission with maximum safety
+  yield();
+  delay(100);
   
-  // Check free heap before transmission (ESP32-C3 safety)
-  if (ESP.getFreeHeap() < 50000) {  // Less than 50KB free
-    Serial.print("⚠️  Low memory detected: ");
-    Serial.print(ESP.getFreeHeap());
-    Serial.println(" bytes free");
-    delay(100); // Give system time to recover
+  Serial.println("Step 1: beginPacket()");
+  LoRa.beginPacket();
+  yield();
+  delay(100);
+  
+  Serial.println("Step 2: writing data");
+  // Write data byte by byte to be extra safe
+  int len = strlen(commandMsg);
+  for (int i = 0; i < len; i++) {
+    LoRa.write(commandMsg[i]);
+    if (i % 5 == 0) {
+      yield(); // Feed watchdog every 5 characters
+      delayMicroseconds(100);
+    }
   }
   
-  // Send immediately via LoRa
-  LoRa.beginPacket();
-  LoRa.print(command);
+  yield();
+  delay(200); // Long delay before the critical endPacket
+  
+  Serial.println("Step 3: endPacket() - CRITICAL");
+  yield();
+  
   LoRa.endPacket();
   
-  Serial.println("   ✅ LoRa packet transmitted");
+  yield();
+  Serial.println("SUCCESS: Packet sent!");
   
   // Update counters
   commandPacketCount++;
   lastTXResponse = "Command sent: " + command;
   lastCommandTime = millis();
-  
-  // ESP32-C3 Fix: Feed watchdog after transmission
-  yield();
+
+  if (ESP32_C3_FIXES_ENABLED) {
+    Serial.print("Free heap after: ");
+    Serial.println(ESP.getFreeHeap());
+  }
 }
 
 void sendConfigurationToTX() {
@@ -851,12 +886,12 @@ void sendConfigurationToTX() {
     return;
   }
   
-  Serial.println("📤 Sending configuration to TX...");
+  Serial.println("📤 Sending COMBINED configuration to TX...");
   Serial.println("   📋 Configuration Details:");
-  Serial.println("   • Filename: '" + testConfig.filename + "' → will be sent as 'FILENAME:" + testConfig.filename + "'");
-  Serial.println("   • Weight: " + String(testConfig.totalWeight, 2) + " kg → will be sent as 'WEIGHT:" + String(testConfig.totalWeight, 2) + "'");
-  Serial.println("   • Wind: " + String(testConfig.windSpeed, 2) + " m/s → will be sent as 'WIND:" + String(testConfig.windSpeed, 2) + "'");
-  Serial.println("   • Height: " + String(testConfig.height, 2) + " m → will be sent as 'HEIGHT:" + String(testConfig.height, 2) + "'");
+  Serial.println("   • Filename: '" + testConfig.filename + "'");
+  Serial.println("   • Weight: " + String(testConfig.totalWeight, 2) + " kg");
+  Serial.println("   • Wind: " + String(testConfig.windSpeed, 2) + " m/s");
+  Serial.println("   • Height: " + String(testConfig.height, 2) + " m");
   Serial.println("");
   
   // Validate filename before sending
@@ -865,61 +900,28 @@ void sendConfigurationToTX() {
     return;
   }
   
-  // Send configuration commands with better spacing and validation
-  Serial.println("➤ Step 1: Initialize configuration mode");
-  sendLoRaCommandNow("CONFIG_START");
-  delay(700);  // Longer delay to ensure TX enters config mode
-  yield(); // ESP32-C3: Feed watchdog
+  // Create combined CONFIG message (matches updated TX protocol)
+  String combinedConfig = "CONFIG:" + testConfig.filename + "," + 
+                         String((int)testConfig.totalWeight) + "," +
+                         String((int)testConfig.windSpeed) + "," +
+                         String((int)testConfig.height);
   
-  Serial.println("➤ Step 2: Send filename");  
-  // ESP32-C3 Fix: Reduce String operations
-  Serial.print("   📡 Sending: 'FILENAME:");
-  Serial.print(testConfig.filename);
-  Serial.println("'");
-  String filenameCmd = "FILENAME:" + testConfig.filename;
-  sendLoRaCommandNow(filenameCmd);
-  delay(500);  // Longer delay for filename processing
-  yield(); // ESP32-C3: Feed watchdog
+  Serial.println("📡 Sending COMBINED CONFIG: " + combinedConfig);
+  Serial.println("� This matches the updated TX protocol that handles combined CONFIG packets");
   
-  Serial.println("➤ Step 3: Send weight");
-  String weightCmd = "WEIGHT:" + String(testConfig.totalWeight, 2);
-  Serial.println("   📡 Sending: '" + weightCmd + "'");
-  sendLoRaCommandNow(weightCmd);
-  delay(500);  // Longer delay for weight processing
-  yield(); // ESP32-C3: Feed watchdog
-  
-  Serial.println("➤ Step 4: Send wind speed");
-  String windCmd = "WIND:" + String(testConfig.windSpeed, 2);
-  Serial.println("   📡 Sending: '" + windCmd + "'");
-  sendLoRaCommandNow(windCmd);
-  delay(500);  // Longer delay for wind processing
-  yield(); // ESP32-C3: Feed watchdog
-  
-  Serial.println("➤ Step 5: Send height");
-  String heightCmd = "HEIGHT:" + String(testConfig.height, 2);
-  Serial.println("   📡 Sending: '" + heightCmd + "'");
-  sendLoRaCommandNow(heightCmd);
-  delay(500);  // Longer delay for height processing
-  yield(); // ESP32-C3: Feed watchdog
-  
-  Serial.println("➤ Step 6: Finalize configuration");
-  sendLoRaCommandNow("CONFIG_READY");
-  delay(300);  // Allow final processing
-  yield(); // ESP32-C3: Feed watchdog
+  // Send using ultra-safe method
+  sendLoRaCommandNow(combinedConfig);
   
   configurationSent = true;
   Serial.println("");
-  Serial.println("✅ Configuration transmission sequence complete!");
-  Serial.println("🔍 Check TX serial monitor for all 6 commands:");
-  Serial.println("   1. CONFIG_START");
-  Serial.println("   2. " + filenameCmd);
-  Serial.println("   3. " + weightCmd);
-  Serial.println("   4. " + windCmd);
-  Serial.println("   5. " + heightCmd);
-  Serial.println("   6. CONFIG_READY");
+  Serial.println("✅ Configuration transmission complete!");
+  Serial.println("🔍 Check TX serial monitor for:");
+  Serial.println("   • 'LoRa packet received' message");
+  Serial.println("   • 'RX Command: CONFIG:...' message");
+  Serial.println("   • 'Combined CONFIG packet received' message");
+  Serial.println("   • 'Configuration complete - ready to start' message");
   Serial.println("");
-  Serial.println("⚠️  If any command is missing on TX, it might be LoRa packet loss.");
-  Serial.println("💡 Try sending configuration again if TX doesn't show all commands.");
+  Serial.println("⚠️  If TX doesn't show these messages, there may be LoRa communication issues.");
 }
 
 // === MENU SYSTEM IMPLEMENTATION ===
